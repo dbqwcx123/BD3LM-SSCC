@@ -9,6 +9,7 @@ import torch.nn.functional as F
 import transformers
 from tqdm import tqdm
 from collections import OrderedDict
+import os
 
 import dataloader
 import metrics
@@ -667,13 +668,17 @@ class Diffusion(L.LightningModule):
       return self.tokenizer.batch_decode(samples)
     if self.sampler == 'semi_ar':
       for _ in range(self.config.sampling.num_sample_batches):
+        # adjust num_steps based on block entropy
+        effective_num_steps = self._compute_num_steps_from_block_entropy(
+          num_steps, batch_size_per_gpu=batch_size_per_gpu)
+
         sample_i, num_tries = None, 0
         while sample_i is None:
           num_tries += 1
           sample_i, nfes = self._semi_ar_sampler(
             n_samples=batch_size_per_gpu,
             num_strides=(seqlen // self.block_size), 
-            num_steps=num_steps,
+            num_steps=effective_num_steps,
             seqlen=seqlen)
           if num_tries > 10:
             raise ValueError('Sampling failed.')
@@ -698,6 +703,78 @@ class Diffusion(L.LightningModule):
         self.metrics.gen_nfes.append(nfes)
     samples = torch.cat(samples, dim=0) 
     return self.tokenizer.batch_decode(samples)
+
+  @torch.no_grad()
+  def _compute_num_steps_from_block_entropy(self, num_steps, batch_size_per_gpu=None):
+    """Compute an adjusted num_steps based on token-level block entropy.
+
+    If the entropy of the denoising distribution for a masked block is less than
+    2.0 (nats), reduce num_steps to half (minimum 1). This helper only probes
+    the model and returns the possibly adjusted number of steps. It does not
+    perform sampling itself. The method is safe to call when `self.sampler` is
+    'semi_ar' but will simply return `num_steps` for other samplers.
+
+    Args:
+      num_steps: int or None, proposed number of steps.
+      batch_size_per_gpu: optional int for probe batch size (defaults to 1).
+
+    Returns:
+      int or None: adjusted number of steps (or original if adjustment not possible).
+    """
+
+    if num_steps is None:
+      return num_steps
+
+    probe_bs = 1 if batch_size_per_gpu is None else max(1, int(batch_size_per_gpu))
+    try:
+      # Build a masked probe block
+      x_probe = torch.full((probe_bs, self.block_size), self.mask_index, dtype=torch.long, device=self.device)
+      if self.tokenizer is not None and self.block_size > 0:
+        x_probe[:, 0] = self.tokenizer.bos_token_id
+
+      # get sigma corresponding to t=1
+      _, p_probe = self.noise(torch.ones((probe_bs, 1), device=self.device))
+      sigma_probe = self._sigma_from_p(p_probe[:, 0].unsqueeze(-1))
+
+      model_out = self.forward(x_probe, sigma_probe)
+      # convert to probabilities
+      if model_out.dtype.is_floating_point:
+        probs = model_out.exp()
+      else:
+        probs = model_out.to(torch.float32).exp()
+
+      eps = 1e-12
+      probs_clamped = probs.clamp(min=eps)
+      per_token_entropy = -(probs_clamped * probs_clamped.log()).sum(dim=-1)
+
+      masked_mask = (x_probe == self.mask_index)
+      if masked_mask.any():
+        block_entropy = per_token_entropy[masked_mask].mean().item()
+      else:
+        block_entropy = float('inf')
+
+      adjusted = num_steps
+      if block_entropy <= 2.0:
+        adjusted = max(1, int(num_steps // 2))
+      if block_entropy > 2.0 & block_entropy <= 3.0:
+        adjusted = max(1, int(num_steps // 1.5))
+      
+
+      # log to file for debugging (append mode) in outputs/
+      try:
+        os.makedirs('outputs', exist_ok=True)
+        log_path = os.path.join('outputs', 'blockEntropy.txt')
+        with open(log_path, 'a') as fh:
+          fh.write(f"block_entropy={block_entropy:.6f}, original_num_steps={num_steps}, adjusted_num_steps={adjusted}\n")
+          fh.flush()
+      except Exception:
+        # ignore logging errors
+        pass
+
+      return adjusted
+    except Exception:
+      # If probing fails for any reason, return original value
+      return num_steps
 
   def _sigma_from_p(self, p):
     return torch.min(- torch.log(1 - p), self.noise.sigma_max)
@@ -1056,6 +1133,7 @@ class Diffusion(L.LightningModule):
     entropy = torch.special.entr(counts.float() / counts.sum()).sum()
     return entropy
   
+  # TODO: refactor this method to add complexity based stopping criteria. figure out how to formulate the complexity metric
   def _check_stop_conds(self, x):
     """Check if sampling should stop based on 1) eos, 2) entropy, or 3) likelihood.
     Entropy/likelihood evaluated on last 256 token-block.
