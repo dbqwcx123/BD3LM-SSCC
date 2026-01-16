@@ -39,7 +39,7 @@ class Diffusion(L.LightningModule):
   def __init__(
     self,
     config,
-    tokenizer: transformers.PreTrainedTokenizer):
+    tokenizer):
     super().__init__()
     self.save_hyperparameters()
     self.config = config

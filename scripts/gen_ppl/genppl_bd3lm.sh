@@ -21,8 +21,8 @@ srun python -u main.py \
     loader.eval_batch_size=1 \
     model=small \
     algo=bd3lm \
-    algo.T=5000 \
     algo.backbone=hf_dit \
+    algo.T=5000 \
     data=openwebtext-split \
     model.length=$LENGTH \
     block_size=$BLOCK_SIZE \
