@@ -1,5 +1,4 @@
 # [Block Diffusion: Interpolating Between Autoregressive and Diffusion Language Models](https://arxiv.org/abs/2503.09573) (ICLR 2025 Oral)
-By [Marianne Arriola](https://m-arriola.com/), [Aaron Gokaslan](https://skylion007.github.io), [Justin T Chiu](https://justinchiu.netlify.app), [Zhihan Yang](https://zhihanyang2022.github.io/), [Zhixuan Qi](https://zhixuanqi.com/), [Jiaqi Han](https://hanjq17.github.io/), [Subham Sekhar Sahoo](https://s-sahoo.github.io), [Volodymyr Kuleshov](https://www.cs.cornell.edu/~kuleshov/)
 
 <!-- [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/18nC6q7dWq154fI1BXPLwmtnS7Zvbrv6p?usp=sharing/) -->
 [![deploy](https://img.shields.io/badge/Paper_📃-green)](https://openreview.net/forum?id=tyEyYT267x)
@@ -18,11 +17,7 @@ In this repo, we provide:
   1. Block-autoregressive likelihood parameterization
   2. Data-driven noise schedules to reduce training variance
   3. Arbitrary-length discrete diffusion samplers
-* **Baseline implementations**
-  1. Autoregressive model [[AR](https://arxiv.org/abs/2406.07524)]
-  2. Score Entropy Based Discrete Diffusion [[SEDD](https://arxiv.org/abs/2310.16834)]
-  3. Masked Diffusion Language Model [[MDLM](https://arxiv.org/abs/2406.07524)]
-  4. Semi-autoregressive Simplex-based Diffusion Language Model [[SSD-LM](https://arxiv.org/pdf/2210.17432)] *(supports sample generation only)*
+* **Baseline implementations (deleted)**
 
 <a name="code-organization"></a>
 ## Code Organization
@@ -35,13 +30,8 @@ In this repo, we provide:
 7. ```configs/```: Config files for datasets/models/noise schedules/LR schedules
 8. ```scripts/```: Shell scripts for training/evaluation
     - ``train/``: Training scripts (LM1B, OWT)
-    - ``ppl/``: Likelihood evaluation on the pretraining set (LM1B, OWT)
-    - ``zs_ppl/``: Zero-shot likelihood evaluation on GPT2 benchmark datasets
     - ``gen_ppl/``: Sample quality (generative perplexity under GPT2)
     - ``var_len/``: Arbitrary-length sequence generation
-9. ```ssd-lm/```: SSD-LM codebase
-    - ```run_generate_text_batch.sh```: Generates SSD-LM samples
-    - ```report_genppl.py```: Reports generative perplexity of SSD-LM samples
 
 
 <a name="getting_started"></a>
@@ -55,8 +45,6 @@ conda create --name bd3lm python=3.9
 conda activate bd3lm
 pip install -r requirements.txt
 ```
-While BD3-LMs don't require FlashAttention, evaluating baselines from MDLM require `flash-attn==2.5.6`
-
 Create the following directories to store saved models and slurm logs:
 ```bash
 mkdir outputs watch_folder logs sample_logs
@@ -71,11 +59,6 @@ sbatch scripts/train/train_owt_bd3lm.sh
 We have uploaded BD3-LMs trained on OpenWebText using block sizes 4, 8, 16 for 1M training steps to HuggingFace 🤗:
 [kuleshov-group/bd3-lms](https://huggingface.co/collections/kuleshov-group/bd3-lms-67be95f81b96b15fec50d53f) BD3-LMs are finetuned from an MDLM checkpoint trained on OpenWebText for 850K gradient updates. We release the pretraining checkpoint on HuggingFace: [kuleshov-group/bd3lm-owt-block_size1024-pretrain](https://huggingface.co/kuleshov-group/bd3lm-owt-block_size1024-pretrain)
 
-
-The MDLM baseline is also found on the HuggingFace:
-[kuleshov-group/mdlm-owt](https://huggingface.co/kuleshov-group/mdlm-owt). The AR and SEDD baselines trained on OpenWebText in this [Google Drive folder](https://drive.google.com/drive/folders/16LuuptK7Xfk-vzhQYZBZ0SA-B-BFluau?usp=sharing).
-
-For arbitrary-length sequence generation, we compare with AR, SEDD, and MDLM (supported as an inference-only technique and does not feature a training objective), and SSD-LM. In order to generate sequences longer than the training context size (fixed at 1024 tokens for OWT), we retrained AR and MDLM from Sahoo et. al without artificially injecting BOS/EOS tokens in the context. We also provide these checkpoints on HuggingFace: [kuleshov-group/mdlm-noeos-owt](https://huggingface.co/kuleshov-group/mdlm-noeos-owt), [kuleshov-group/sedd-noeos-owt](https://huggingface.co/kuleshov-group/sedd-noeos-owt), [kuleshov-group/ar-noeos-owt](https://huggingface.co/kuleshov-group/ar-noeos-owt).
 
 ## Reproducing Experiments
 
@@ -132,25 +115,6 @@ python -u main.py \
     sampling.logdir=$PWD/sample_logs/samples_genlen_bd3lm_blocksize${BLOCK_SIZE}
 ```
 
-### Likelihood Evaluation 
-To compute test perplexity, use `mode=ppl_eval`. Example scripts are provided in `scripts/ppl/eval_owt_*.sh`. Here's an example evaluation script on OpenWebText:
-```bash
-BLOCK_SIZE=4 # 4, 8, 16
-
-python -u main.py \
-    loader.eval_batch_size=16 \
-    model=small \
-    algo=bd3lm \
-    algo.backbone=hf_dit \
-    data=openwebtext-split \
-    data.insert_valid_special=False \
-    model.length=1024 \
-    model.attn_backend=flex \
-    block_size=${BLOCK_SIZE} \
-    eval.checkpoint_path=kuleshov-group/bd3lm-owt-block_size${BLOCK_SIZE} \
-    wandb=null \
-    mode=ppl_eval > logs/bd3lm_owt_block_size${BLOCK_SIZE}.log
-```
 
 ### Training Pipeline
 To train BD3-LMs, use `mode=train` (default mode). Example scripts are provided in `scripts/train/train_owt*.sh`. Here's an example training script on OpenWebText:
