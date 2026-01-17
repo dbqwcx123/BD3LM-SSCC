@@ -9,24 +9,20 @@ import torch.nn.functional as F
 import transformers
 from tqdm import tqdm
 from collections import OrderedDict
+import numpy as np
+import itertools
+import math
 
 import dataloader
 import metrics
 import models
 import noise_schedule
 import utils
-import numpy as np
-import itertools
 
 def _sample_categorical(categorical_probs):
   gumbel_norm = (1e-10 - (torch.rand_like(categorical_probs) + 1e-10).log())
   samples = (categorical_probs / gumbel_norm).argmax(dim=-1)
   return samples
-
-def _unsqueeze(x, reference):
-  return x.view(
-    * x.shape,
-    * ((1,) * (len(reference.shape) - len(x.shape))))
 
 @dataclass
 class Loss:
@@ -546,9 +542,11 @@ class Diffusion(L.LightningModule):
     x_block =  copy_flag * x[:, -self.block_size:] + (1 - copy_flag) * x_block
     x_new = torch.cat((x[:, :-self.block_size], x_block), dim=-1)
 
-    # compute kv cache if all tokens in a block are sampled
-    if self.config.sampling.kv_cache and self.mask_index not in x_block:
-      _ = self.forward(x_block, sigma_t, sample_mode=True, store_kv=True)
+    # [Modify] Removed internal store_kv logic to avoid duplicate updates.
+    # KV cache update is now handled in _semi_ar_sampler after the block generation is complete.
+    # if self.config.sampling.kv_cache and self.mask_index not in x_block:
+    #   # compute kv cache if all tokens in a block are sampled
+    #   _ = self.forward(x_block, sigma_t, sample_mode=True, store_kv=True)
 
     if not torch.allclose(x_new, x):
       return None, x_new
@@ -569,9 +567,11 @@ class Diffusion(L.LightningModule):
       sample_i, num_tries = None, 0
       while sample_i is None:
         num_tries += 1
+        # [Modify] handle non-divisible lengths
+        num_strides = math.ceil(seqlen / self.block_size)
         sample_i, nfes = self._semi_ar_sampler(
           n_samples=batch_size_per_gpu,
-          num_strides=(seqlen // self.block_size), 
+          num_strides=num_strides,  # (seqlen // self.block_size), 
           num_steps=num_steps,
           seqlen=seqlen)
         if num_tries > 10:
@@ -794,6 +794,13 @@ class Diffusion(L.LightningModule):
        
         x_accum[:, fwd_idx] = x_next
 
+      # [Modify] Update KV cache explicitly after the block is fully generated
+      if self.config.sampling.kv_cache:
+          # Extract the just-generated block (last block_size tokens)
+          # x_next here contains [context, new_block], we only need new_block for the forward pass call that updates cache
+          current_block = x_accum[:, fwd_idx][:, -self.block_size:]
+          _ = self.forward(current_block, t * ones, sample_mode=True, store_kv=True)
+      
       # check if we need to resample (or stop sampling for variable-length sampling)
       if x_accum.shape[1] > 256:
         stop, x_accum = self._check_stop_conds(x_accum)
@@ -802,6 +809,11 @@ class Diffusion(L.LightningModule):
           return None, None
         elif stop:
           break
+        
+    # [Modify] Truncate to the exact requested length (handling the padded last block)
+    if seqlen is not None:
+        x_accum = x_accum[:, :seqlen]
+    
     return x_accum, sampling_steps
   
   def _compute_entropy(self, x):
