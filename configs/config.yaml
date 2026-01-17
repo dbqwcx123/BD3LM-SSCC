@@ -8,10 +8,10 @@ defaults:
   - /lr_scheduler: constant_warmup
   - /algo: bd3lm
 
-mode: train  # train / ppl_eval / sample_eval
+mode: train  # train / sample_eval
 diffusion: absorbing_state
 
-seed: 1
+seed: 42
 
 block_size: ${model.length}
 

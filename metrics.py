@@ -39,13 +39,13 @@ class Metrics:
   def __init__(self, config=None) -> None:
     self.config=config
     metrics = torchmetrics.MetricCollection({
-        'nll': NLL(), 'bpd': BPD(), 'ppl': Perplexity()})
+        'nll': NLL(), 'bpd': BPD(), 'ppl': Perplexity()})  # bpd: bits per dimension
     if hasattr(config, 'block_size'):
       self.block_size = config.block_size
     else:
       self.block_size = config.model.length
-      
-    self.nfes = NFEs()
+    
+    self.nfes = NFEs()  # 生成样本时模型被调用的次数
     self.train_nlls = metrics.clone(prefix='train/')
     self.valid_nlls = metrics.clone(prefix='val/')
     self.gen_ppl = Perplexity()
@@ -58,7 +58,7 @@ class Metrics:
       self.clip_search_delta = config.algo.clip_search_delta
     self.valid_vars = {self.sampling_eps: []}
     if getattr(config.algo, 'var_min', None):
-      self.valid_vars = self.init_valid_vars()
+      self.valid_vars = self.init_valid_vars()  # 方差
     self.eval_ppl_batch_size = \
      self.config.eval.perplexity_batch_size
     self.gen_ppl_eval_model_name_or_path = \

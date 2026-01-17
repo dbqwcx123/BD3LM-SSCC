@@ -64,16 +64,9 @@ class Diffusion(L.LightningModule):
       self.block_size = self.config.block_size
     else:
       self.block_size = self.config.model.length
-    if self.parameterization == 'ar':
-      self.block_size = 1
     if self.config.algo.backbone == 'dit':
       self.backbone = models.dit.DIT(
         self.config, vocab_size=self.vocab_size)
-    elif self.config.algo.backbone == 'dimamba':
-      self.backbone = models.dimamba.DiMamba(
-        self.config,
-        vocab_size=self.vocab_size,
-        pad_token_id=self.tokenizer.pad_token_id)
     elif self.config.algo.backbone == 'hf_dit':
       self.backbone = transformers.AutoModelForMaskedLM.from_pretrained(
         config.eval.checkpoint_path, trust_remote_code=True)
@@ -133,15 +126,9 @@ class Diffusion(L.LightningModule):
     if self.config.mode == 'sample_eval' and \
         self.config.sampling.first_hitting:
       assert self.config.loader.eval_batch_size == 1
-    assert self.config.algo.backbone in {
-      'dit', 'ar', 'hf_dit'}
-    if self.config.algo.parameterization == 'ar':
-      assert not self.config.algo.time_conditioning
+    assert self.config.algo.backbone in {'dit', 'ar', 'hf_dit'}
     if self.config.sampling.kv_cache:
       assert self.config.algo.name in {'ar', 'bd3lm'}
-      
-    if self.parameterization in {'sedd'}:
-      assert self.time_conditioning
     
     if self.config.mode == 'sample_eval':
       assert self.config.model.attn_backend != 'flex', 'FlexAttention mask not supported at inference.'
@@ -290,25 +277,8 @@ class Diffusion(L.LightningModule):
     logits[unmasked_indices, xt[unmasked_indices]] = 0
     return logits
 
-  def _sedd_parameterization(self, logits, xt, sigma):
-    esigm1_log = torch.where(
-      sigma < 0.5,
-      torch.expm1(sigma),
-      sigma.exp() - 1).log().to(logits.dtype)
-    # logits shape
-    # (batch_size, diffusion_model_input_length, vocab_size)
-    logits = logits - esigm1_log[:, None, None] - np.log(
-      logits.shape[-1] - 1)
-    # The below scatter operation sets the log score
-    # for the input word to 0.
-    logits = torch.scatter(logits, -1, xt[..., None],
-                           torch.zeros_like(logits[..., :1]))
-    return logits
-
   def _process_sigma(self, sigma):
     # cause of overfitting for block size 1?
-    if self.parameterization == 'ar':
-      return None
     assert sigma.ndim == 2
     sigma = sigma.mean(-1).squeeze()
     if sigma.ndim == 0:
@@ -322,30 +292,13 @@ class Diffusion(L.LightningModule):
     """Returns log score."""
     sigma = self._process_sigma(sigma)
     with torch.amp.autocast('cuda', dtype=torch.float32):
-      if self.config.algo.name == 'bd3lm':
-        logits = self.backbone(x, sigma,
-                              store_kv=store_kv,
-                              sample_mode=sample_mode)
-      elif self.config.algo.name == 'ar':
-        if self.config.algo.backbone == 'hf_dit':
-          logits = self.backbone(x, None)     
-        else:
-          logits = self.backbone(x, sigma, sample_mode=sample_mode, store_kv=store_kv)
-        logits[:, :, self.mask_index] = self.neg_infinity
-        logits = logits.log_softmax(-1)
-      else:
-        logits = self.backbone(x, sigma)
+      logits = self.backbone(x, sigma)
 
     if self.cross_attn:
       x = x[:, :self.config.model.length]
-    if self.parameterization == 'subs':
-      return self._subs_parameterization(logits=logits,
-                                      xt=x)
-    elif self.parameterization == 'sedd':
-      return self._sedd_parameterization(logits=logits,
-                                        xt=x,
-                                        sigma=sigma)
-    return logits
+    # self.parameterization == 'subs':
+    return self._subs_parameterization(logits=logits, xt=x)
+    # return logits
     
   def on_train_epoch_start(self):
     self.backbone.train()
@@ -601,48 +554,6 @@ class Diffusion(L.LightningModule):
       return None, x_new
     else:
       return p_x0, x_new
-
-  @torch.no_grad()
-  def _ar_sampler(self, bsz, context_len=1024):
-    # reset kvs
-    if self.config.sampling.kv_cache:
-      self.backbone.reset_kv_cache()
-
-    with torch.amp.autocast('cuda', dtype=torch.float32):
-      # precompute token buffer
-      num_pred_tokens = self.num_tokens - 1
-      x = torch.zeros(
-        (bsz, num_pred_tokens + 1),
-        dtype=torch.long,
-        device=self.device)
-      x[:, 0] = self.tokenizer.bos_token_id
-      stop = False
-      for i in tqdm(range(num_pred_tokens)):
-        # need to sample a gumbel for each token
-        # to save memory in variable-length sampling
-        noise = (torch.distributions.Gumbel(0, 1)
-                .sample((bsz, self.vocab_size))
-                .to(self.device))
-        next_logits = self.forward(
-          x[:, :i + 1][:, -context_len:],
-          None,
-          store_kv=self.config.sampling.kv_cache)[:, -1:].to(torch.float64)
-    
-        next_logits = next_logits.exp()
-        next_logits = self._nucleus_sample(next_logits).log()
-        y = (next_logits[:, -1] + noise).argmax(-1)
-        # check if we need to resample (or stop sampling for variable-length sampling)
-        if (i+1) > 256:
-          stop, x_out = self._check_stop_conds(x[:, :i+1])
-          if stop:
-            x = x_out
-        if (stop and not self.config.sampling.var_length) \
-          or (stop and x.shape[-1] == 1):
-          return None
-        elif stop:
-          break
-        x[:, i + 1] = y
-      return x
   
   @torch.no_grad()
   def _sample(
@@ -653,49 +564,21 @@ class Diffusion(L.LightningModule):
     if batch_size_per_gpu is None:
       batch_size_per_gpu = self.config.loader.eval_batch_size
     samples = []
-    if self.parameterization == 'ar':
-      for _ in range(self.config.sampling.num_sample_batches):
-        sample_i, num_tries = None, 0
-        while sample_i is None:
-          num_tries += 1
-          sample_i = self._ar_sampler(batch_size_per_gpu)
-          if num_tries > 10:
-            raise ValueError('Sampling failed.')
-        samples.append(sample_i)
-        self.metrics.gen_nfes.append(self.config.model.length)
-      samples = torch.cat(samples, dim=0) 
-      return self.tokenizer.batch_decode(samples)
-    if self.sampler == 'semi_ar':
-      for _ in range(self.config.sampling.num_sample_batches):
-        sample_i, num_tries = None, 0
-        while sample_i is None:
-          num_tries += 1
-          sample_i, nfes = self._semi_ar_sampler(
-            n_samples=batch_size_per_gpu,
-            num_strides=(seqlen // self.block_size), 
-            num_steps=num_steps,
-            seqlen=seqlen)
-          if num_tries > 10:
-            raise ValueError('Sampling failed.')
-        samples.append(sample_i)
-        self.metrics.nfes.update(nfes)
-        self.metrics.gen_nfes.append(nfes)
-    else:
-      nfes = num_steps
-      for _ in range(self.config.sampling.num_sample_batches):
-        sample_i, num_tries = None, 0
-        while sample_i is None:
-          sample_i = self._analytic_sampler(
-            n_samples=batch_size_per_gpu,
-            num_steps=num_steps,
-            seqlen=seqlen,
-            eps=eps)
-          num_tries += 1
-          if num_tries > 10 and sample_i is None:
-            raise ValueError('Sampling failed.')
-        samples.append(sample_i)
-        self.metrics.nfes.update(nfes)
-        self.metrics.gen_nfes.append(nfes)
+    # self.sampler == 'semi_ar':
+    for _ in range(self.config.sampling.num_sample_batches):
+      sample_i, num_tries = None, 0
+      while sample_i is None:
+        num_tries += 1
+        sample_i, nfes = self._semi_ar_sampler(
+          n_samples=batch_size_per_gpu,
+          num_strides=(seqlen // self.block_size), 
+          num_steps=num_steps,
+          seqlen=seqlen)
+        if num_tries > 10:
+          raise ValueError('Sampling failed.')
+      samples.append(sample_i)
+      self.metrics.nfes.update(nfes)
+      self.metrics.gen_nfes.append(nfes)
     samples = torch.cat(samples, dim=0) 
     return self.tokenizer.batch_decode(samples)
 
@@ -720,50 +603,6 @@ class Diffusion(L.LightningModule):
       self.config.loader.eval_batch_size,
       self.device)
     return samples
-
-  def get_score(self, x, sigma):
-    model_output = self.forward(x, sigma).to(torch.float64)
-    if self.config.sampling.nucleus_p == 1.0:
-      return model_output.exp()
-    model_output = model_output - model_output.logsumexp(-1, keepdim=True)
-    model_output = self._nucleus_sample(model_output.exp())
-    return model_output
-
-  def _staggered_score(self, score, dsigma):
-    score = score.clone()
-    extra_const = (1 - dsigma.exp()) * score.sum(dim=-1)
-    score *= dsigma.exp()[:, None]
-    score[..., self.mask_index] += extra_const
-    return score
-
-  def _analytic_update(self, x, t, dt):
-    sigma_t = self._sigma_from_p(self.noise(t)[1])
-    sigma_s = self._sigma_from_p(self.noise(t - dt)[1])
-    dsigma = sigma_t - sigma_s
-    score = self.get_score(x, sigma_t)
-    stag_score = self._staggered_score(score, dsigma)
-    probs = stag_score * self._transp_transition(x, dsigma)
-    return _sample_categorical(probs)
-
-
-  def _denoiser_update(self, x, t):
-    sigma = self._sigma_from_p(self.noise(t)[1])
-    score = self.get_score(x, sigma)
-    stag_score = self._staggered_score(score, sigma)
-    probs = stag_score * self._transp_transition(x, sigma)
-    probs[..., self.mask_index] = 0
-    samples = _sample_categorical(probs)
-    return samples
-
-
-  def _transp_transition(self, i, sigma):
-    sigma = _unsqueeze(sigma, reference=i[..., None])
-    edge = torch.exp(-sigma) * F.one_hot(
-      i, num_classes=self.vocab_size)
-    edge += torch.where(i == self.mask_index,
-                        1 - torch.exp(-sigma).squeeze(-1),
-                        0)[..., None]
-    return edge
 
   def _sample_t(
       self, batch_dims, device, sampling_eps_min, sampling_eps_max, block_size=None):
@@ -805,10 +644,6 @@ class Diffusion(L.LightningModule):
       if self.config.data.insert_train_special == True:
         input_tokens[:, 0] = self.tokenizer.bos_token_id
         output_tokens[:, -1] = self.tokenizer.eos_token_id
-    elif self.parameterization == 'ar':
-      input_tokens = x0[:, :-1]
-      output_tokens = x0[:, 1:]
-      new_attention_mask = attention_mask[:, 1:]
     else:
       input_tokens = x0
       output_tokens = None
@@ -850,10 +685,6 @@ class Diffusion(L.LightningModule):
     model_output = self.forward(x_input, sigma=sigma)
     utils.print_nans(model_output, 'model_output')
 
-    if self.parameterization == 'sedd':
-      return dsigma * self._score_entropy(
-        model_output, sigma, xt, x0)
-
     log_p_theta = torch.gather(
       input=model_output,
       dim=-1,
@@ -871,15 +702,11 @@ class Diffusion(L.LightningModule):
     (input_tokens, output_tokens,
      attention_mask) = self._maybe_sub_sample(
        x0, attention_mask)
-    if self.parameterization == 'ar':
-      output = self.forward(input_tokens, None)
-      loss = - output.gather(
-        -1, output_tokens[:, :, None])[:, :, 0]
-    else:
-      loss = self._forward_pass_diffusion(
-        input_tokens,
-        sampling_eps_min=sampling_eps_min,
-        sampling_eps_max=sampling_eps_max,)
+    # self.parameterization == 'subs':
+    loss = self._forward_pass_diffusion(
+      input_tokens,
+      sampling_eps_min=sampling_eps_min,
+      sampling_eps_max=sampling_eps_max,)
     
     if self.ignore_bos and not self.training:
       attention_mask[:, 0] = 0
@@ -912,81 +739,13 @@ class Diffusion(L.LightningModule):
       self.sampling_eps_min.fill_(sampling_eps_min_best)
       self.sampling_eps_max.fill_(sampling_eps_max_best)
 
-  def _score_entropy(self, log_score, sigma, xt, x0):
-    """Computes the SEDD loss.
-
-    Args:
-      log_score: float torch.Tensor with shape (batch_size,
-          diffusion_model_input_length, vocab_size),
-          log score, output of the denoising network.
-      xt: int torch.Tensor with shape (batch_size,
-          diffusion_model_input_length), input.
-      x0: int torch.Tensor with shape (batch_size,
-          diffusion_model_input_length), input.
-      sigma: float torch.Tensor with shape (batch_size, 1).
-
-    Returns:
-      loss with shape (batch_size, diffusion_model_input_length)
-    """
-    masked_indices = xt == self.mask_index
-
-    expsig_minus_1 = torch.expm1(sigma).expand_as(xt)
-    q_ratio = 1 / expsig_minus_1[masked_indices]
-
-    words_that_were_masked = x0[masked_indices]
-
-    neg_term = q_ratio * torch.gather(
-      log_score[masked_indices],
-      -1,
-      words_that_were_masked[..., None]).squeeze(-1)
-    score = log_score[masked_indices].exp()
-    if self.mask_index == self.vocab_size - 1:
-      pos_term = score[:, :-1].sum(dim=-1)
-    else:
-      pos_term = score[:, : self.mask_index].sum(
-        dim=-1) + score[:, self.mask_index + 1:].sum(dim=-1)
-    const = q_ratio * (q_ratio.log() - 1)
-
-    entropy = torch.zeros(* xt.shape, device=xt.device)
-    entropy[masked_indices] += pos_term - neg_term + const
-    return entropy
-
-  @torch.no_grad
-  def _analytic_sampler(
-    self, n_samples, num_steps, seqlen, eps=1e-5): 
-    x = self._sample_prior(
-      n_samples,
-      seqlen).to(self.device)
-    x[:, 0] = self.tokenizer.bos_token_id
-    timesteps = torch.linspace(
-      1, eps, num_steps + 1, device=self.device)
-    dt = (1 - eps) / num_steps
-    for i in tqdm(range(num_steps), desc='step'):
-      t = timesteps[i] * torch.ones(
-        x.shape[0], 1, device=self.device)
-      x = self._analytic_update(x=x, t=t, dt=dt)
-    # denoising step 
-    t = timesteps[-1] * torch.ones(x.shape[0], 1,
-                                  device=self.device)
-    x = self._denoiser_update(x=x, t=t)
-    
-    stop, x = self._check_stop_conds(x)
-    if stop:
-      return None
-    return x
-
   @torch.no_grad
   def _semi_ar_sampler(
     self, n_samples, num_steps, num_strides, seqlen, context_size=1024):
     if seqlen is None:
       seqlen = self.config.model.length
     sampling_steps = 0
-          
-    mdlm_semi_ar = self.config.algo.name == 'mdlm' and self.config.model.length > self.block_size
-    if mdlm_semi_ar:
-      # sliding window of length 512 for mdlm semi-ar decoding
-      num_strides = self.config.model.length // 512
-      num_strides -= 1
+    
 
     ones = torch.ones((n_samples,1), dtype=self.dtype,
                       device=self.device)
@@ -1001,18 +760,13 @@ class Diffusion(L.LightningModule):
         x_accum = self._sample_prior(n_samples, self.block_size).to(self.device)
         x_accum[:, 0] = self.tokenizer.bos_token_id
       else:
-        if mdlm_semi_ar:
-          x = self._sample_prior(n_samples, 512).to(self.device)
-        else:
-          x = self._sample_prior(n_samples, self.block_size).to(self.device)
+        x = self._sample_prior(n_samples, self.block_size).to(self.device)
         x_accum = torch.cat((x_accum, x), dim=1)
 
       # compute logits in a sliding window (context passed to model can't exceed context_size)
       end_idx = (stride_num + 1) * self.block_size
       start_idx = max(end_idx - context_size, 0)
       fwd_idx = torch.arange(start_idx, end_idx)
-      if mdlm_semi_ar and stride_num > 0: # MDLM
-        fwd_idx = torch.arange(512*(stride_num), (512*(stride_num))+self.block_size)
 
       dt = 1 / num_steps
       p_x0_cache = None
@@ -1027,8 +781,7 @@ class Diffusion(L.LightningModule):
           u = np.random.rand()
           num_masked = (x_accum[:, fwd_idx] == self.mask_index).sum(-1).item()
           t *= u**(1 / num_masked)
-              
-        elif not self.config.sampling.first_hitting:
+        else:
           t = timesteps[i]
 
         p_x0_cache, x_next = self._ddpm_caching_update(

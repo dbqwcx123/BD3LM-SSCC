@@ -109,36 +109,6 @@ def generate_samples(config, logger, tokenizer):
   utils.update_and_save_csv(save_dict, csv_path)
   return text_samples
 
-def _ppl_eval(config, logger, tokenizer):
-  logger.info('Starting Eval.')
-  model = _load_from_checkpoint(config=config,
-                                tokenizer=tokenizer)
-
-  if config.eval.disable_ema:
-    logger.info('Disabling EMA.')
-    model.ema = None
-
-  wandb_logger = None
-  if config.get('wandb', None) is not None:
-    wandb_logger = L.pytorch.loggers.WandbLogger(
-      config=omegaconf.OmegaConf.to_object(config),
-      ** config.wandb)
-  callbacks = []
-  if 'callbacks' in config:
-    for _, callback in config.callbacks.items():
-      callbacks.append(hydra.utils.instantiate(callback))
-  seed = config.seed
-  trainer = hydra.utils.instantiate(
-    config.trainer,
-    default_root_dir=os.getcwd(),
-    callbacks=callbacks,
-    strategy=hydra.utils.instantiate(config.strategy),
-    logger=wandb_logger)
-  L.seed_everything(seed)
-  config.seed = seed
-  _, valid_ds = dataloader.get_dataloaders(
-    config, tokenizer, skip_train=True, valid_seed=seed)
-  trainer.validate(model, valid_ds)
 
 def _train(config, logger, tokenizer):
   logger.info('Starting Training.')
@@ -201,7 +171,8 @@ def _train(config, logger, tokenizer):
     logger=wandb_logger)
 
   trainer.fit(model, train_ds, valid_ds, ckpt_path=ckpt_path)
-  
+
+
 @hydra.main(version_base=None, config_path='configs',
             config_name='config')
 def main(config):
@@ -215,11 +186,9 @@ def main(config):
   if config.mode == 'sample_eval':
     config.wandb = None
     samples = generate_samples(config, logger, tokenizer)
-  elif config.mode == 'ppl_eval':
-    config.wandb = None
-    _ppl_eval(config, logger, tokenizer)
   else:
     _train(config, logger, tokenizer)
+
 
 
 if __name__ == '__main__':
