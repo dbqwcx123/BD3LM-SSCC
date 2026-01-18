@@ -20,7 +20,7 @@
         "algo.backbone=hf_dit",
         "algo.T=20",
         "data=openwebtext-split",
-        "model.length=200",
+        "model.length=100",
         "block_size=16",
         "wandb=null",
         "mode=sample_eval",

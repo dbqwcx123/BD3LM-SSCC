@@ -1,0 +1,56 @@
+defaults:
+  - _self_
+  - /algo: bd3lm
+  - /model: small
+  - /noise: loglinear
+
+mode: sample_eval  # train / sample_eval
+diffusion: absorbing_state
+
+seed: 42
+
+block_size: ${model.length}
+
+data:
+  train: openwebtext-train
+  valid: openwebtext-valid
+  tokenizer_name_or_path: /mnt/e/1Master1/0Science_Research/0DLM-SSCC/Model/gpt2
+
+loader:
+  eval_batch_size: 1
+
+sampling:
+  noise_removal: False
+  num_sample_batches: 1  # Total samples: `num_gpus` * `loader.eval_batch_size` * num_sample_batches
+  var_length: False
+  logdir: ./samples_${algo.name}_len${model.length}_blocksize${block_size}
+  nucleus_p: 0.9
+  first_hitting: True # should be set to true when T >> block_size
+  kv_cache: True
+
+trainer:
+  devices: ${device_count:}
+  num_nodes: 1
+
+training:
+  ema: 0.9999
+  antithetic_sampling: True
+  sampling_eps: 1e-3
+  sampling_eps_min: 1e-3
+  sampling_eps_max: 1.0
+
+eval:
+  checkpoint_path: ${cwd:}/checkpoints/last.ckpt  # Used to evaluate a checkpoint after training.
+  disable_ema: False
+  perplexity_batch_size: 8
+  gen_ppl_eval_model_name_or_path: /mnt/e/1Master1/0Science_Research/0DLM-SSCC/Model/gpt2  # gpt2-large, meta-llama/Llama-2-7b-hf
+
+hydra:
+  run:
+    dir: ./outputs/${data.train}/${now:%Y.%m.%d}/${now:%H%M%S}
+  job:
+    chdir: true
+
+checkpointing:
+  # Use custom `save_dir` if, e.g., saving to S3 bucket, otherwise leave this parameter as is
+  save_dir: ${cwd:}

@@ -569,10 +569,10 @@ class Diffusion(L.LightningModule):
       while sample_i is None:
         num_tries += 1
         # [Modify] handle non-divisible lengths
-        num_strides = math.ceil(seqlen / self.block_size)
+        # num_strides = math.ceil(seqlen / self.block_size)
         sample_i, nfes = self._semi_ar_sampler(
           n_samples=batch_size_per_gpu,
-          num_strides=num_strides,  # (seqlen // self.block_size), 
+          num_strides=(seqlen // self.block_size), 
           num_steps=num_steps,
           seqlen=seqlen)
         if num_tries > 10:
