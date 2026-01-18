@@ -47,7 +47,6 @@ class Diffusion(L.LightningModule):
     self.antithetic_sampling = self.config.training.antithetic_sampling
     self.cross_attn = self.config.algo.cross_attn
     self.ignore_bos = self.config.algo.ignore_bos
-    self.mdlm_loss_scale = self.config.algo.mdlm_loss_scale
     if (not hasattr(self.tokenizer, 'mask_token')
         or self.tokenizer.mask_token is None):
       self.mask_index = self.vocab_size
@@ -68,7 +67,7 @@ class Diffusion(L.LightningModule):
     elif self.config.algo.backbone == 'hf_dit':
       self.backbone = transformers.AutoModelForMaskedLM.from_pretrained(
         config.eval.checkpoint_path, trust_remote_code=True, local_files_only=True)
-      #  egenerate mask if pretrained model uses flex attention mask
+      # Regenerate mask if pretrained model uses flex attention mask
       # and current model uses sdpa mask
       if getattr(self.backbone.config, 'attn_backend', None) == 'flex' and \
         self.config.model.attn_backend == 'sdpa':
@@ -599,11 +598,6 @@ class Diffusion(L.LightningModule):
       batch_size_per_gpu=self.config.loader.eval_batch_size,
       num_steps=num_steps,
       eps=eps)
-    # self.metrics.record_generative_perplexity(
-    #   samples,
-    #   self.config.model.length,
-    #   self.config.loader.eval_batch_size,
-    #   self.device)
     return samples
 
   def _sample_t(
@@ -662,14 +656,6 @@ class Diffusion(L.LightningModule):
 
     loss_scale, p = self.noise(t)
     sigma = self._sigma_from_p(p[:,0].unsqueeze(-1))
-    dsigma = - loss_scale * torch.expm1(sigma) # used for sedd
-
-    # below is needed to reproduce mdlm/sedd numbers with models from sahoo et al
-    # (numerical imprecision computing probs under loglinear schedule)
-    if self.mdlm_loss_scale:
-      sigma, dsigma = self.noise.total_noise(t), self.noise.rate_noise(t)
-      p = 1 - torch.exp(-sigma)
-      loss_scale = - (dsigma / torch.expm1(sigma))
 
     xt = self.q_xt(x0,
                    p,

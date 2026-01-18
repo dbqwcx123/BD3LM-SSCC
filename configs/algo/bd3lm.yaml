@@ -12,4 +12,3 @@ clip_search_delta: 0.05
 clip_search_widths: []
 fix_clipping: False
 sampler: semi_ar
-mdlm_loss_scale: False
