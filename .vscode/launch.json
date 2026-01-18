@@ -1,0 +1,45 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "调试 BD3LM main.py",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "TRANSFORMERS_OFFLINE": "1",
+        // "HF_HUB_OFFLINE": "1",
+        "PYTHONPATH": "${workspaceFolder}"
+      },
+      "args": [
+        "loader.eval_batch_size=1",
+        "model=small",
+        "algo=bd3lm",
+        "algo.backbone=hf_dit",
+        "algo.T=20",
+        "data=openwebtext-split",
+        "model.length=200",
+        "block_size=16",
+        "wandb=null",
+        "mode=sample_eval",
+        "eval.checkpoint_path=/mnt/e/1Master1/0Science_Research/0DLM-SSCC/Model/bd3lm/bd3lm-owt-block_size16",
+        "model.attn_backend=sdpa",
+        "seed=42",
+        "sampling.num_sample_batches=1",
+        "sampling.nucleus_p=0.9",
+        "sampling.kv_cache=true",
+        "sampling.logdir=./sample_logs"
+      ]
+    },
+    {
+      "name": "Python: 当前文件",
+      "type": "python",
+      "request": "launch",
+      "program": "${file}",
+      "console": "integratedTerminal",
+      "justMyCode": false
+    }
+  ]
+}

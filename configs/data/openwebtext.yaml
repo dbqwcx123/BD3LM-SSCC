@@ -1,6 +1,6 @@
 train: openwebtext
 valid: wikitext103
-tokenizer_name_or_path: gpt2
+tokenizer_name_or_path: /mnt/e/1Master1/0Science_Research/0DLM-SSCC/Model/gpt2
 cache_dir: /share/kuleshov/ssahoo/textdiffusion/data
 wrap: True
 streaming: False

@@ -85,28 +85,26 @@ def _print_batch(train_ds, valid_ds, tokenizer, k=64):
 
 def generate_samples(config, logger, tokenizer):
   logger.info('Generating samples.')
-  model = _load_from_checkpoint(config=config,
-                                tokenizer=tokenizer)
+  model = _load_from_checkpoint(config=config,  tokenizer=tokenizer)
   if config.eval.disable_ema:
     logger.info('Disabling EMA.')
     model.ema = None
-  text_samples = model.restore_model_and_sample(
-    num_steps=config.algo.T)
+  text_samples = model.restore_model_and_sample(num_steps=config.algo.T)
   print('Text samples:', text_samples)
-  print('Generative perplexity:',
-        model.metrics.gen_ppl.compute())
-  print('Entropy:', model.metrics.gen_entropy.compute())
-  csv_path = config.sampling.logdir
-  save_dict = {'gen_ppl': model.metrics.gen_ppls,
-                'gen_nfes': model.metrics.gen_nfes,
-                'gen_entropy': model.metrics.gen_entropies,
-                'gen_lengths': model.metrics.gen_lengths,
-                'samples': [[i] for i in text_samples],
-                'seed': [config.seed for _ in range(len(text_samples))]}
-  if config.sampling.var_length:
-    print(text_samples)
-    save_dict['samples'] = ['' for _ in range(len(text_samples))]
-  utils.update_and_save_csv(save_dict, csv_path)
+  # print('Generative perplexity:',
+  #       model.metrics.gen_ppl.compute())
+  # print('Entropy:', model.metrics.gen_entropy.compute())
+  # csv_path = config.sampling.logdir
+  # save_dict = {'gen_ppl': model.metrics.gen_ppls,
+  #               'gen_nfes': model.metrics.gen_nfes,
+  #               'gen_entropy': model.metrics.gen_entropies,
+  #               'gen_lengths': model.metrics.gen_lengths,
+  #               'samples': [[i] for i in text_samples],
+  #               'seed': [config.seed for _ in range(len(text_samples))]}
+  # if config.sampling.var_length:
+  #   print(text_samples)
+  #   save_dict['samples'] = ['' for _ in range(len(text_samples))]
+  # utils.update_and_save_csv(save_dict, csv_path)
   return text_samples
 
 

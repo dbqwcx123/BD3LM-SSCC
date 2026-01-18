@@ -3,13 +3,13 @@ python main.py \
     model=small \
     algo=bd3lm \
     algo.backbone=hf_dit \
-    algo.T=200 \
+    algo.T=20 \
     data=openwebtext-split \
-    model.length=1000 \
+    model.length=200 \
     block_size=16 \
     wandb=null \
     mode=sample_eval \
-    eval.checkpoint_path='../Model/bd3lm/bd3lm-owt-block_size16' \
+    eval.checkpoint_path=/mnt/e/1Master1/0Science_Research/0DLM-SSCC/Model/bd3lm/bd3lm-owt-block_size16 \
     model.attn_backend=sdpa \
     seed=42 \
     sampling.num_sample_batches=1 \

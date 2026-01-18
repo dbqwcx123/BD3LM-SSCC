@@ -1,7 +1,7 @@
 train: openwebtext-train
 valid: openwebtext-valid
-tokenizer_name_or_path: gpt2
-cache_dir: /share/kuleshov/ssahoo/textdiffusion/data
+tokenizer_name_or_path: /mnt/e/1Master1/0Science_Research/0DLM-SSCC/Model/gpt2
+cache_dir: /mnt/e/1Master1/0Science_Research/0DLM-SSCC/BD3LM-SSCC/cache
 wrap: True
 streaming: False
 insert_train_eos: True

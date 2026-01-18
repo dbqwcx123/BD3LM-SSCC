@@ -1,3 +1,5 @@
+import os
+os.environ['TRANSFORMERS_OFFLINE'] = '1'
 import itertools
 from dataclasses import dataclass
 
@@ -65,7 +67,7 @@ class Diffusion(L.LightningModule):
         self.config, vocab_size=self.vocab_size)
     elif self.config.algo.backbone == 'hf_dit':
       self.backbone = transformers.AutoModelForMaskedLM.from_pretrained(
-        config.eval.checkpoint_path, trust_remote_code=True)
+        config.eval.checkpoint_path, trust_remote_code=True, local_files_only=True)
       #  egenerate mask if pretrained model uses flex attention mask
       # and current model uses sdpa mask
       if getattr(self.backbone.config, 'attn_backend', None) == 'flex' and \
@@ -288,7 +290,7 @@ class Diffusion(L.LightningModule):
     """Returns log score."""
     sigma = self._process_sigma(sigma)
     with torch.amp.autocast('cuda', dtype=torch.float32):
-      logits = self.backbone(x, sigma)
+      logits = self.backbone(x, sigma, sample_mode, store_kv)  # [Modified]
 
     if self.cross_attn:
       x = x[:, :self.config.model.length]
@@ -544,9 +546,9 @@ class Diffusion(L.LightningModule):
 
     # [Modify] Removed internal store_kv logic to avoid duplicate updates.
     # KV cache update is now handled in _semi_ar_sampler after the block generation is complete.
-    # if self.config.sampling.kv_cache and self.mask_index not in x_block:
-    #   # compute kv cache if all tokens in a block are sampled
-    #   _ = self.forward(x_block, sigma_t, sample_mode=True, store_kv=True)
+    if self.config.sampling.kv_cache and self.mask_index not in x_block:
+      # compute kv cache if all tokens in a block are sampled
+      _ = self.forward(x_block, sigma_t, sample_mode=True, store_kv=True)
 
     if not torch.allclose(x_new, x):
       return None, x_new
@@ -597,11 +599,11 @@ class Diffusion(L.LightningModule):
       batch_size_per_gpu=self.config.loader.eval_batch_size,
       num_steps=num_steps,
       eps=eps)
-    self.metrics.record_generative_perplexity(
-      samples,
-      self.config.model.length,
-      self.config.loader.eval_batch_size,
-      self.device)
+    # self.metrics.record_generative_perplexity(
+    #   samples,
+    #   self.config.model.length,
+    #   self.config.loader.eval_batch_size,
+    #   self.device)
     return samples
 
   def _sample_t(
@@ -795,11 +797,11 @@ class Diffusion(L.LightningModule):
         x_accum[:, fwd_idx] = x_next
 
       # [Modify] Update KV cache explicitly after the block is fully generated
-      if self.config.sampling.kv_cache:
-          # Extract the just-generated block (last block_size tokens)
-          # x_next here contains [context, new_block], we only need new_block for the forward pass call that updates cache
-          current_block = x_accum[:, fwd_idx][:, -self.block_size:]
-          _ = self.forward(current_block, t * ones, sample_mode=True, store_kv=True)
+      # if self.config.sampling.kv_cache:
+      #     # Extract the just-generated block (last block_size tokens)
+      #     # x_next here contains [context, new_block], we only need new_block for the forward pass call that updates cache
+      #     current_block = x_accum[:, fwd_idx][:, -self.block_size:]
+      #     _ = self.forward(current_block, t * ones, sample_mode=True, store_kv=True)
       
       # check if we need to resample (or stop sampling for variable-length sampling)
       if x_accum.shape[1] > 256:
@@ -811,8 +813,8 @@ class Diffusion(L.LightningModule):
           break
         
     # [Modify] Truncate to the exact requested length (handling the padded last block)
-    if seqlen is not None:
-        x_accum = x_accum[:, :seqlen]
+    # if seqlen is not None:
+    #     x_accum = x_accum[:, :seqlen]
     
     return x_accum, sampling_steps
   

@@ -645,7 +645,7 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     super().__init__()
     if type(config) == dict:
       config = omegaconf.OmegaConf.create(config)
-    self.causal = getattr(config.model, 'causal_attention', config.algo.parameterization == 'ar')
+    self.causal = False  # getattr(config.model, 'causal_attention', config.algo.parameterization == 'ar')
     self.n = config.model.length
     self.adaLN = not self.causal or getattr(config.model, 'adaln', False)
     self.config = config
