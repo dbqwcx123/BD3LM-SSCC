@@ -34,10 +34,7 @@ trainer:
 
 training:
   ema: 0.9999
-  antithetic_sampling: True
   sampling_eps: 1e-3
-  sampling_eps_min: 1e-3
-  sampling_eps_max: 1.0
 
 eval:
   checkpoint_path: ${cwd:}/checkpoints/last.ckpt  # Used to evaluate a checkpoint after training.

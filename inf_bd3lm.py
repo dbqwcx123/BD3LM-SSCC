@@ -8,9 +8,10 @@ import rich.tree
 import torch
 import transformers
 
-import dataloader
-import diffusion
-import utils
+import tokenizers
+import diffusion_inf
+import logging
+import lightning
 
 omegaconf.OmegaConf.register_new_resolver(
   'cwd', os.getcwd)
@@ -22,17 +23,56 @@ omegaconf.OmegaConf.register_new_resolver(
   'div_up', lambda x, y: (x + y - 1) // y)
 
 
-def _load_from_checkpoint(config, tokenizer):
-  if 'hf' in config.algo.backbone:
-    return diffusion.Diffusion(
-      config, tokenizer=tokenizer).to('cuda')
-  
-  return diffusion.Diffusion.load_from_checkpoint(
-    config.eval.checkpoint_path,
-    tokenizer=tokenizer,
-    config=config,
-    strict=False,
-    weights_only=False).to('cuda')
+def get_logger(name=__name__, level=logging.INFO) -> logging.Logger:
+  """Initializes multi-GPU-friendly python logger."""
+
+  logger = logging.getLogger(name)
+  logger.setLevel(level)
+
+  # this ensures all logging levels get marked with the rank zero decorator
+  # otherwise logs would get multiplied for each GPU process in multi-GPU setup
+  for level in ('debug', 'info', 'warning', 'error',
+                'exception', 'fatal', 'critical'):
+    setattr(logger,
+            level,
+            lightning.pytorch.utilities.rank_zero_only(
+              getattr(logger, level)))
+
+  return logger
+
+def get_tokenizer(config):
+  if config.data.tokenizer_name_or_path == 'bert-base-uncased':
+    tokenizer = transformers.BertTokenizer.\
+      from_pretrained('bert-base-uncased')
+  else:
+    tokenizer = transformers.AutoTokenizer.from_pretrained(
+      config.data.tokenizer_name_or_path)
+
+  if (isinstance(tokenizer, transformers.GPT2TokenizerFast)
+      or isinstance(tokenizer, transformers.GPT2Tokenizer)):
+    tokenizer._tokenizer.post_processor = tokenizers.processors.BertProcessing(
+      (tokenizer.bos_token, tokenizer.bos_token_id),
+      (tokenizer.eos_token, tokenizer.eos_token_id))
+
+  # For wrapped batches:
+  #  [BOS] sent1 [EOS] sent2-fragment [EOS]
+  #  [BOS] sent2-fragment [EOS] sent3 [EOS]
+  if tokenizer.bos_token is None:
+    if tokenizer.cls_token is None:
+      raise AttributeError(
+        'Tokenizer must have a bos_token or '
+        f'cls_token: {tokenizer}')
+    tokenizer.bos_token = tokenizer.cls_token
+  if tokenizer.eos_token is None:
+    if tokenizer.sep_token is None:
+      raise AttributeError(
+        'Tokenizer must have a eos_token '
+        f'or sep_token: {tokenizer}')
+    tokenizer.eos_token = tokenizer.sep_token
+  if tokenizer.pad_token is None:
+    tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+
+  return tokenizer
 
 @L.pytorch.utilities.rank_zero_only
 def _print_config(
@@ -68,9 +108,10 @@ def _print_config(
         config.checkpointing.save_dir), 'w') as fp:
       rich.print(tree, file=fp)
 
+
 def generate_samples(config, logger, tokenizer):
   logger.info('Generating samples.')
-  model = _load_from_checkpoint(config=config,  tokenizer=tokenizer)
+  model = diffusion_inf.Diffusion(config=config, tokenizer=tokenizer).to('cuda')
   if config.eval.disable_ema:
     logger.info('Disabling EMA.')
     model.ema = None
@@ -82,12 +123,12 @@ def generate_samples(config, logger, tokenizer):
 @hydra.main(version_base=None, config_path='configs',
             config_name='config_inf')
 def main(config):
-  """Main entry point for training."""
+  """Main entry point"""
   L.seed_everything(config.seed)
   _print_config(config, resolve=True, save_cfg=True)
   
-  logger = utils.get_logger(__name__)
-  tokenizer = dataloader.get_tokenizer(config)
+  logger = get_logger(__name__)
+  tokenizer = get_tokenizer(config)
 
   samples = generate_samples(config, logger, tokenizer)
 

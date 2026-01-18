@@ -15,11 +15,9 @@ import numpy as np
 import itertools
 import math
 
-import dataloader
 import metrics
 import models
 import noise_schedule
-import utils
 
 def _sample_categorical(categorical_probs):
   gumbel_norm = (1e-10 - (torch.rand_like(categorical_probs) + 1e-10).log())
@@ -37,8 +35,6 @@ class Diffusion(L.LightningModule):
     self.config = config
     self.tokenizer = tokenizer
     self.vocab_size = self.tokenizer.vocab_size
-    self.sampler = self.config.algo.sampler
-    self.antithetic_sampling = self.config.training.antithetic_sampling
     self.cross_attn = self.config.algo.cross_attn
     self.ignore_bos = self.config.algo.ignore_bos
     if (not hasattr(self.tokenizer, 'mask_token')
@@ -47,10 +43,6 @@ class Diffusion(L.LightningModule):
       self.vocab_size += 1
     else:
       self.mask_index = self.tokenizer.mask_token_id
-    if hasattr(self.config, 'algo'):
-      self.parameterization = self.config.algo.parameterization
-    else:
-      self.parameterization = self.config.parameterization
     if hasattr(self.config, 'block_size'):
       self.block_size = self.config.block_size
     else:
@@ -76,7 +68,6 @@ class Diffusion(L.LightningModule):
     self.num_tokens = self.config.model.length
 
     self.noise = noise_schedule.get_noise(self.config)
-    self.metrics = metrics.Metrics(config)
 
     if self.config.training.ema > 0:
       self.ema = models.ema.ExponentialMovingAverage(
@@ -84,15 +75,7 @@ class Diffusion(L.LightningModule):
         decay=self.config.training.ema)
     else:
       self.ema = None
-    
-    self.var_min = self.config.algo.var_min
-    if self.var_min:
-      self.register_buffer('sampling_eps_min', torch.tensor(
-        self.config.training.sampling_eps_min))
-      self.register_buffer('sampling_eps_max', torch.tensor(
-        self.config.training.sampling_eps_max))
-      
-    self.time_conditioning = self.config.algo.time_conditioning
+
     self.neg_infinity = -1000000.0
 
 
@@ -102,15 +85,11 @@ class Diffusion(L.LightningModule):
     return itertools.chain(* parameters)
 
   def to(self, *args, **kwargs):
-    self = super().to(*args, **kwargs) 
-    self.metrics.to(*args, **kwargs)
+    self = super().to(*args, **kwargs)
     if hasattr(self.backbone, "block_diff_mask") and self.config.model.attn_backend == 'sdpa':
       self.backbone.block_diff_mask = self.backbone.block_diff_mask.to(*args, **kwargs)
     elif hasattr(self.backbone, "block_diff_mask") and self.config.model.attn_backend == 'flex':
       self.backbone.block_diff_mask = self.backbone.block_diff_mask.to(self.device)
-    if hasattr(self, 'sampling_eps_min') and torch.is_tensor(self.sampling_eps_min):
-      self.sampling_eps_min = self.sampling_eps_min.to(*args, **kwargs)
-      self.sampling_eps_max = self.sampling_eps_max.to(*args, **kwargs)
     return self
 
 
@@ -142,8 +121,6 @@ class Diffusion(L.LightningModule):
       sample_i, num_tries = None, 0
       while sample_i is None:
         num_tries += 1
-        # [Modify] handle non-divisible lengths
-        # num_strides = math.ceil(seqlen / self.block_size)
         sample_i, nfes = self._semi_ar_sampler(
           n_samples=batch_size_per_gpu,
           num_strides=(seqlen // self.block_size), 
@@ -152,7 +129,6 @@ class Diffusion(L.LightningModule):
         if num_tries > 10:
           raise ValueError('Sampling failed.')
       samples.append(sample_i)
-      self.metrics.nfes.update(nfes)
     samples = torch.cat(samples, dim=0) 
     return self.tokenizer.batch_decode(samples)
 
@@ -210,13 +186,6 @@ class Diffusion(L.LightningModule):
           sampling_steps += 1
        
         x_accum[:, fwd_idx] = x_next
-
-      # [Modify] Update KV cache explicitly after the block is fully generated
-      # if self.config.sampling.kv_cache:
-      #     # Extract the just-generated block (last block_size tokens)
-      #     # x_next here contains [context, new_block], we only need new_block for the forward pass call that updates cache
-      #     current_block = x_accum[:, fwd_idx][:, -self.block_size:]
-      #     _ = self.forward(current_block, t * ones, sample_mode=True, store_kv=True)
       
       # check if we need to resample (or stop sampling for variable-length sampling)
       if x_accum.shape[1] > 256:
@@ -226,10 +195,6 @@ class Diffusion(L.LightningModule):
           return None, None
         elif stop:
           break
-        
-    # [Modify] Truncate to the exact requested length (handling the padded last block)
-    # if seqlen is not None:
-    #     x_accum = x_accum[:, :seqlen]
     
     return x_accum, sampling_steps
 
@@ -307,8 +272,7 @@ class Diffusion(L.LightningModule):
     sigma = sigma.mean(-1).squeeze()
     if sigma.ndim == 0:
       sigma = sigma.unsqueeze(0)
-    if not self.time_conditioning:
-      sigma = torch.zeros_like(sigma)
+    sigma = torch.zeros_like(sigma)
     assert sigma.ndim == 1, sigma.shape
     return sigma
 
