@@ -84,17 +84,11 @@ class Metrics:
   def to(self, *args, **kwargs):
     self.train_nlls = self.train_nlls.to(*args, **kwargs)
     self.valid_nlls = self.valid_nlls.to(*args, **kwargs)
-    self.gen_ppl = self.gen_ppl.to(*args, **kwargs)
     self.nfes = self.nfes.to(*args, **kwargs)
-    self.gen_entropy = self.gen_entropy.to(*args, **kwargs)
 
   def reset(self):
-    self.gen_ppls, self.gen_nfes, self.gen_entropies, self.gen_lengths \
-      = [], [], [], []
     self.train_nlls.reset()
     self.valid_nlls.reset()
-    self.gen_ppl.reset()
-    self.gen_entropy.reset()
     self.nfes.reset()
     if getattr(self.config.algo, 'var_min', None):
       self.init_valid_vars()
