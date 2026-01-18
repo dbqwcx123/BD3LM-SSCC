@@ -17,14 +17,14 @@ data:
   tokenizer_name_or_path: /mnt/e/1Master1/0Science_Research/0DLM-SSCC/Model/gpt2
 
 loader:
-  eval_batch_size: 1
+  eval_batch_size: 1  # fixed in generate
 
 sampling:
   noise_removal: False
   num_sample_batches: 1  # Total samples: `num_gpus` * `loader.eval_batch_size` * num_sample_batches
   var_length: False
   logdir: ./samples_${algo.name}_len${model.length}_blocksize${block_size}
-  nucleus_p: 0.9
+  nucleus_p: 1
   first_hitting: True # should be set to true when T >> block_size
   kv_cache: True
 

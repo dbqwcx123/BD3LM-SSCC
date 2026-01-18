@@ -102,7 +102,7 @@ class Diffusion(L.LightningModule):
     self.noise.eval()
     samples = self._sample(
       seqlen=seqlen,
-      batch_size_per_gpu=self.config.loader.eval_batch_size,
+      batch_size_per_gpu=1,
       num_steps=num_steps,
       eps=eps)
     return samples
@@ -114,7 +114,7 @@ class Diffusion(L.LightningModule):
     if seqlen is None:
       seqlen = self.config.model.length
     if batch_size_per_gpu is None:
-      batch_size_per_gpu = self.config.loader.eval_batch_size
+      batch_size_per_gpu = 1
     samples = []
     # self.sampler == 'semi_ar':
     for _ in range(self.config.sampling.num_sample_batches):
@@ -145,7 +145,7 @@ class Diffusion(L.LightningModule):
     
     # reset kvs
     if self.config.sampling.kv_cache:
-      self.backbone.reset_kv_cache(eval_batch_size=self.config.loader.eval_batch_size)
+      self.backbone.reset_kv_cache(eval_batch_size=1)
 
     for stride_num in tqdm(range(num_strides)):
       # sample next block
@@ -222,7 +222,7 @@ class Diffusion(L.LightningModule):
                           sample_mode=True).to(torch.float64)
         p_x0 = p_x0[:, -self.block_size:]
       p_x0 = p_x0.exp()
-      p_x0 = self._nucleus_sample(p_x0)
+      # p_x0 = self._nucleus_sample(p_x0)
 
     if self.config.sampling.first_hitting:
       x_block = _sample_categorical(p_x0)
@@ -259,10 +259,7 @@ class Diffusion(L.LightningModule):
     sigma = self._process_sigma(sigma)
     with torch.amp.autocast('cuda', dtype=torch.float32):
       logits = self.backbone(x, sigma, sample_mode, store_kv)  # [Modified]
-
-    if self.cross_attn:
-      x = x[:, :self.config.model.length]
-    # self.parameterization == 'subs':
+    x = x[:, :self.config.model.length]
     return self._subs_parameterization(logits=logits, xt=x)
     # return logits
 
@@ -293,22 +290,6 @@ class Diffusion(L.LightningModule):
     logits[unmasked_indices] = self.neg_infinity
     logits[unmasked_indices, xt[unmasked_indices]] = 0
     return logits
-
-  @torch.no_grad()
-  def _nucleus_sample(self, p_x0):
-    p = self.config.sampling.nucleus_p
-    if p == 1.0:
-      return p_x0
-    p_x0_ = p_x0[:, -self.block_size:].clone()
-    sorted_probs, sorted_indices = p_x0_.sort(dim=-1, descending=True)
-    cum_probs = sorted_probs.cumsum(dim=-1)
-    nucleus_mask = cum_probs <= p
-    nucleus_mask[..., 0] = 1
-    sorted_probs = sorted_probs * nucleus_mask
-    p_x0_.scatter_(-1, sorted_indices, sorted_probs * nucleus_mask)
-    p_x0_ /= p_x0_.sum(-1, keepdim=True)
-    p_x0[:, -self.block_size:] = p_x0_
-    return p_x0
 
   def _check_stop_conds(self, x):
     """Check if sampling should stop based on 1) eos, 2) entropy, or 3) likelihood.
