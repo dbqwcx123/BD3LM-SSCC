@@ -579,7 +579,6 @@ class Diffusion(L.LightningModule):
           raise ValueError('Sampling failed.')
       samples.append(sample_i)
       self.metrics.nfes.update(nfes)
-      self.metrics.gen_nfes.append(nfes)
     samples = torch.cat(samples, dim=0) 
     return self.tokenizer.batch_decode(samples)
 
