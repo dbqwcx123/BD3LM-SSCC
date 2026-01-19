@@ -204,19 +204,21 @@ class Diffusion(L.LightningModule):
 
   @torch.no_grad()
   def _ddpm_caching_update(self, x, t, dt, p_x0=None):
-    _, move_chance_t = self.noise(t)
-    _, move_chance_s = self.noise(t - dt)
+    _, move_chance_t = self.noise(t)       # 当前时刻 t 保持掩码的概率
+    _, move_chance_s = self.noise(t - dt)  # 下一时刻 s 保持掩码的概率
     sigma_t = self._sigma_from_p(move_chance_t)
     move_chance_t = move_chance_t[:, None]
     move_chance_s = move_chance_s[:, None]
-    mask_prob = move_chance_s / move_chance_t
+    mask_prob = move_chance_s / move_chance_t  # 条件概率：当前是Mask的前提下，下一步继续保持Mask的概率
 
     if p_x0 is None:
       if self.config.sampling.kv_cache:
+        # 只输入最后 block_size 长度的 token 进行预测
         p_x0 = self.forward(x[:, -self.block_size:],
                         sigma_t,
                         sample_mode=True).to(torch.float64)
       else:   
+        # 全量输入，最后截取 block_size 长度
         p_x0 = self.forward(x,
                           sigma_t,
                           sample_mode=True).to(torch.float64)
@@ -225,23 +227,23 @@ class Diffusion(L.LightningModule):
       # p_x0 = self._nucleus_sample(p_x0)
 
     if self.config.sampling.first_hitting:
-      x_block = _sample_categorical(p_x0)
+      x_block = _sample_categorical(p_x0)  # 根据预测概率采样出所有位置的候选词
       # randomly and uniformly select an index in the block (among masked tokens)
       num_masked = (x[:, -self.block_size:] == self.mask_index).sum(-1)
-      ind = torch.randint(0, num_masked, (x_block.shape[0],))
-      ind = (x[:, -self.block_size:] == self.mask_index).nonzero()[ind, 1]
+      ind = torch.randint(0, num_masked, (x_block.shape[0],))  # 随机选第几个 Mask
+      ind = (x[:, -self.block_size:] == self.mask_index).nonzero()[ind, 1]  # Mask 在 Block 中的具体索引
       mask = (torch.arange(self.block_size, device=x.device) == ind[:, None]).to(x_block.dtype)
       x_block = x_block * mask + x[:, -self.block_size:] * (1 - mask)
     else:
+      # 将 Mask Token 的概率设为 mask_prob, 每个位置独立决定是变成具体的词，还是保持 Mask
       q_xs = p_x0 * (1 - mask_prob)
       q_xs[:, :, self.mask_index] = mask_prob.squeeze(-1)
       x_block = _sample_categorical(q_xs)
+    # 融合旧状态，已经生成的词不会被覆盖
     copy_flag = (x[:, -self.block_size:] != self.mask_index).to(x.dtype)
     x_block =  copy_flag * x[:, -self.block_size:] + (1 - copy_flag) * x_block
     x_new = torch.cat((x[:, :-self.block_size], x_block), dim=-1)
 
-    # [Modify] Removed internal store_kv logic to avoid duplicate updates.
-    # KV cache update is now handled in _semi_ar_sampler after the block generation is complete.
     if self.config.sampling.kv_cache and self.mask_index not in x_block:
       # compute kv cache if all tokens in a block are sampled
       _ = self.forward(x_block, sigma_t, sample_mode=True, store_kv=True)
