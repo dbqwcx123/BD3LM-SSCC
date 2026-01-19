@@ -1,8 +1,8 @@
-python inf_bd3lm.py \
+python text_decompress_bd3lm.py \
     algo.backbone=hf_dit \
-    algo.T=16 \
-    sampling.first_hitting=True \
-    model.length=20 \
+    algo.T=10 \
+    sampling.first_hitting=False \
+    model.length=1024 \
     block_size=16 \
     eval.checkpoint_path=/mnt/e/1Master1/0Science_Research/0DLM-SSCC/Model/bd3lm/bd3lm-owt-block_size16 \
     model.attn_backend=sdpa \
