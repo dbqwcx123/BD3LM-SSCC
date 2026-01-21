@@ -116,3 +116,14 @@ def get_logger(name=__name__, level=logging.INFO) -> logging.Logger:
               getattr(logger, level)))
 
   return logger
+
+def get_tokenizer(config):
+    import transformers
+    tokenizer = transformers.AutoTokenizer.from_pretrained(config.data.tokenizer_name_or_path)
+    if tokenizer.bos_token is None and tokenizer.cls_token is not None:
+        tokenizer.bos_token = tokenizer.cls_token
+    if tokenizer.eos_token is None and tokenizer.sep_token is not None:
+        tokenizer.eos_token = tokenizer.sep_token
+    if tokenizer.pad_token is None:
+        tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+    return tokenizer
