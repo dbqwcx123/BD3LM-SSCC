@@ -1,5 +1,6 @@
 import os
 os.environ['TRANSFORMERS_OFFLINE'] = '1'
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import itertools
 from dataclasses import dataclass
 
@@ -13,9 +14,7 @@ from tqdm import tqdm
 from collections import OrderedDict
 import numpy as np
 import itertools
-import math
 
-import metrics
 import models
 import noise_schedule
 
@@ -52,7 +51,7 @@ class Diffusion(L.LightningModule):
         self.config, vocab_size=self.vocab_size)
     elif self.config.algo.backbone == 'hf_dit':
       self.backbone = transformers.AutoModelForMaskedLM.from_pretrained(
-        config.eval.checkpoint_path, trust_remote_code=True, local_files_only=True)
+        config.sampling.checkpoint_path, trust_remote_code=True, local_files_only=True)
       # Regenerate mask if pretrained model uses flex attention mask
       # and current model uses sdpa mask
       if getattr(self.backbone.config, 'attn_backend', None) == 'flex' and \
@@ -68,13 +67,6 @@ class Diffusion(L.LightningModule):
     self.num_tokens = self.config.model.length
 
     self.noise = noise_schedule.get_noise(self.config)
-
-    if self.config.training.ema > 0:
-      self.ema = models.ema.ExponentialMovingAverage(
-        self._get_parameters(),
-        decay=self.config.training.ema)
-    else:
-      self.ema = None
 
     self.neg_infinity = -1000000.0
 
@@ -95,9 +87,6 @@ class Diffusion(L.LightningModule):
 
   def restore_model_and_sample(self, num_steps, eps=1e-5, seqlen=None):
     """Generate samples from the model."""
-    if self.ema:  
-      self.ema.store(self._get_parameters())
-      self.ema.copy_to(self._get_parameters())
     self.backbone.eval()
     self.noise.eval()
     samples = self._sample(

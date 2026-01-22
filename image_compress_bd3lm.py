@@ -12,7 +12,7 @@ import diffusion_inf
 from code_utils import arithmetic_coder
 from code_utils.ac_utils import normalize_pdf_for_arithmetic_coding
 from code_utils.pixel_token_dict import compute_pixel_token_ids, tokenid_to_pixel
-import constants, utils
+import utils
 import data_loaders 
 
 # --- Hydra Resolvers ---
@@ -20,6 +20,11 @@ OmegaConf.register_new_resolver('cwd', os.getcwd)
 OmegaConf.register_new_resolver('device_count', torch.cuda.device_count)
 OmegaConf.register_new_resolver('eval', eval)
 OmegaConf.register_new_resolver('div_up', lambda x, y: (x + y - 1) // y)
+OmegaConf.register_new_resolver("sqrt", lambda x: int(x**0.5))
+OmegaConf.register_new_resolver("compute_num_patches", 
+                                lambda num_images, image_size, patch_size: 
+                                    int(num_images * (image_size / patch_size)**2 * 3))
+OmegaConf.register_new_resolver("calc", lambda expr: eval(expr))
 
 def get_confidence_simple(log_probs_pixel, mask_indices):
     """
@@ -27,7 +32,7 @@ def get_confidence_simple(log_probs_pixel, mask_indices):
     """
     # log_probs_pixel: [1, seq_len, 256]
     # 转 double 防止溢出，计算 softmax
-    probs = torch.softmax(log_probs_pixel.double(), dim=-1).float() 
+    probs = torch.softmax(log_probs_pixel, dim=-1)
     max_probs, _ = torch.max(probs, dim=-1) 
     confidences = max_probs[0, mask_indices]
     return confidences
@@ -36,7 +41,7 @@ def get_confidence_entropy(logits, mask_indices):
     """
     基于负熵计算置信度
     """
-    log_probs = F.log_softmax(logits.double(), dim=-1).float() 
+    log_probs = F.log_softmax(logits, dim=-1)
     probs = torch.exp(log_probs)
     
     # 计算熵: H(x) = - sum(p * log(p))
@@ -70,7 +75,7 @@ def compress_single_patch(model, tokenizer, config, current_block_ids, pixel_tok
             break
         
         t = timesteps[i]  # 当前时间步
-            # 计算噪声水平 Sigma
+        # 计算噪声水平 Sigma
         _, move_chance_t = model.noise(t)
         sigma = model._sigma_from_p(move_chance_t).to(device)
         sigma = sigma.view(1, 1).repeat(1, 1)  # [Batch=1, 1]
@@ -131,9 +136,9 @@ def run_compression_pipeline(model, tokenizer, config, data_iterator, device):
     pixel_token_ids_tensor = torch.tensor(pixel_token_ids, device=device)
 
     # 计算通道切换阈值
-    H_patch, W_patch = constants.CHUNK_SHAPE_2D
-    IMG_H, IMG_W, IMG_C = constants.IMAGE_SHAPE_TEST
-    patches_per_channel = constants.PATCHES_PER_IMAGE_TEST
+    H_patch = config.data.patch_size
+    IMG_H = config.data.image_size_test
+    patches_per_channel = np.square(IMG_H // H_patch)
     
     # 强制初始化 KV Cache
     config.sampling.kv_cache = True
@@ -144,49 +149,44 @@ def run_compression_pipeline(model, tokenizer, config, data_iterator, device):
     patch_counter_in_frame = 0 
     total_bits, total_pixels = 0, 0
     
-    print(f"开始压缩流程: Image {IMG_H}x{IMG_W}, Patch {H_patch}x{W_patch}")
+    print(f"开始压缩流程: Image {IMG_H}x{IMG_H}, Patch {H_patch}x{H_patch}")
     
     # 2. 数据集迭代
     pbar = tqdm(data_iterator)
     for data, frame_id in pbar:
-        # -------------------------------------------------------
-        # Context 状态管理 (Reset 逻辑)
-        # -------------------------------------------------------
+        # KV Cache 重置逻辑
         need_reset = False
-        # Case A: 新图片 (Frame Change)
+        # 1. 新图片
         if frame_id != prev_frame_id:
+            print(f"--- New pic (frame_id: {frame_id}), KV Cache reset ---")
             need_reset = True
             prev_frame_id = frame_id
             patch_counter_in_frame = 0
-        # Case B: 新通道 (Channel Switch)
+        # 2. 新通道
         elif patch_counter_in_frame > 0 and (patch_counter_in_frame % patches_per_channel == 0):
+            print(f"--- Channel Switch, KV Cache reset: {reset_channel_context} ---")
             if reset_channel_context:
                 need_reset = True
-        # 执行 Reset
         if need_reset:
             model.backbone.reset_kv_cache()
         
-        # -------------------------------------------------------
         # 数据准备
-        # -------------------------------------------------------
-        # data is [H, W, C] -> flatten -> tokens
+        # data [H, W, C] -> flatten -> tokens
         seq_array = data.reshape(1, model.block_size)
         flattened_array = seq_array.flatten()
         num_str_tokens = [str(num) for num in flattened_array]
         current_block_ids = tokenizer.convert_tokens_to_ids(num_str_tokens)
         
-        # -------------------------------------------------------
         # 压缩核心逻辑
-        # -------------------------------------------------------
         # 每个 Patch 独立编码为一行 Bitstream
         output_bits = []
         encoder = arithmetic_coder.Encoder(
-            base=constants.ARITHMETIC_CODER_BASE,
-            precision=constants.ARITHMETIC_CODER_PRECISION,
+            base=config.data.ac_coder_base,
+            precision=config.data.ac_coder_precision,
             output_fn=output_bits.append,
         )
 
-        # 调用 Block 级压缩
+        # Block 级压缩
         filled_block_tensor = compress_single_patch(
             model, tokenizer, config, current_block_ids, 
             pixel_token_ids_tensor, device, encoder
@@ -195,20 +195,15 @@ def run_compression_pipeline(model, tokenizer, config, data_iterator, device):
         encoder.terminate()
         compressed_bits = "".join(map(str, output_bits))
         
-        # -------------------------------------------------------
         # 更新 KV Cache (Sliding Window)
-        # -------------------------------------------------------
         with torch.no_grad():
             sigma_zero = torch.zeros((1, 1), device=device)
             _ = model.forward(filled_block_tensor, sigma_zero, sample_mode=True, store_kv=True)
             
         patch_counter_in_frame += 1
 
-        # -------------------------------------------------------
         # 结果写入
-        # -------------------------------------------------------
-        # 添加 Stop Bit 保护
-        bits_to_write = compressed_bits + '1'
+        bits_to_write = compressed_bits + '1'  # Stop Bit 保护
         num_bits = len(bits_to_write)
         total_bits += num_bits
         total_pixels += model.block_size
@@ -232,23 +227,30 @@ def main(config):
     tokenizer = utils.get_tokenizer(config)
     
     # 1. 加载模型
-    print(f"Loading model from {config.eval.checkpoint_path}...")
+    print(f"Loading model from {config.sampling.checkpoint_path}...")
     model = diffusion_inf.Diffusion(config=config, tokenizer=tokenizer)
     model.to(device)
     model.backbone.eval()
     model.noise.eval()
     
+    # 开启矩阵乘法精度优化
+    # torch.set_float32_matmul_precision('high')
+    
     # 2. 加载数据
-    print(f"Dataset Path: {config.data.test_dataset_path}")
-    # 校验 Patch 大小
-    assert constants.CHUNK_SHAPE_2D[0] * constants.CHUNK_SHAPE_2D[1] == model.block_size, \
-        "Patch pixels must match Model Block Size (16)"
+    if config.data.test_dataset == "CIFAR10":
+        test_dataset_path = os.path.join(config.data.dataset_root, "CIFAR10", "cifar10_test_one")
+    elif config.data.test_dataset  == "DIV2K":
+        test_dataset_path  = os.path.join(config.data.dataset_root, "DIV2K", "DIV2K_LR_test")
+    elif config.data.test_dataset == "ImageNet":
+        test_dataset_path  = os.path.join(config.data.dataset_root, "ImageNet", "test_unified")
+    print(f"Dataset Path: {test_dataset_path}")
         
     data_iterator = data_loaders.get_image_iterator(
-                    num_chunks=constants.NUM_CHUNKS_TEST,
-                    is_channel_wised=constants.IS_CHANNEL_WISED,
+                    patch_size=config.data.patch_size,
+                    num_chunks=config.data.num_patches_test,
+                    is_channel_wised=config.data.is_channel_wised,
                     is_seq=False, 
-                    data_path=config.data.test_dataset_path)
+                    data_path=test_dataset_path)
 
     # 3. 执行压缩任务
     run_compression_pipeline(model, tokenizer, config, data_iterator, device)

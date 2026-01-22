@@ -34,6 +34,28 @@
       ]
     },
     {
+      "name": "调试 image_compress_bd3lm.py",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/image_compress_bd3lm.py",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "TRANSFORMERS_OFFLINE": "1",
+        // "HF_HUB_OFFLINE": "1",
+        "PYTHONPATH": "${workspaceFolder}"
+      },
+      "args": [
+        "algo.backbone=hf_dit",
+        "algo.T=3",
+        "model.length=1024",
+        "block_size=16",
+        "model.attn_backend=sdpa",
+        "sampling.first_hitting=False",
+        "sampling.reset_channel_context=True",
+      ]
+    },
+    {
       "name": "Python: 当前文件",
       "type": "python",
       "request": "launch",

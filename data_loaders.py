@@ -29,20 +29,19 @@ from torch.utils.data import DataLoader
 from transformers import ImageGPTImageProcessor, ImageGPTForCausalImageModeling
 from PIL import Image
 import matplotlib.pyplot as plt
-import constants
 import sys
 import torchvision
 
 
-def _extract_image_patches(image: np.ndarray) -> Iterator[bytes]:
-    h, w = constants.CHUNK_SHAPE_2D
+def _extract_image_patches(image: np.ndarray, patch_size: int) -> Iterator[bytes]:
+    h, w = patch_size, patch_size
     height, width = image.shape[0], image.shape[1]
     for row, col in itertools.product(range(height // h), range(width // w)):  # 效果等同于两个嵌套for循环
         yield image[row * h: (row + 1) * h, col * w: (col + 1) * w]
         
 
-def _extract_image_sequence(image: np.ndarray) -> Iterator[bytes]:
-    h, w = constants.CHUNK_SHAPE_2D
+def _extract_image_sequence(image: np.ndarray, patch_size: int) -> Iterator[bytes]:
+    h, w = patch_size, patch_size
     height, width = image.shape[0], image.shape[1]
     total_pixels = height * width
     sequence_length = h * w
@@ -78,14 +77,14 @@ def _get_image_dataset(data_path):
 
 
 def get_image_iterator(
-        num_chunks: int = constants.NUM_CHUNKS_TEST,
-        is_channel_wised: bool = constants.IS_CHANNEL_WISED,
+        patch_size: int = -1,
+        num_chunks: int = -1,
+        is_channel_wised: bool = True,
         is_seq: bool = False,
         data_path: str = None,
 ) -> Iterator[bytes]:
     """
     获取数据集的 Patch 迭代器
-    按照 constants.CHUNK_SHAPE_2D 切片
     """
 
     image_dataset = _get_image_dataset(data_path)
@@ -97,14 +96,14 @@ def get_image_iterator(
             # 遍历3个颜色通道 (R, G, B)
             for i in range(data.shape[-1]):
                 temp_data = data[:, :, i:i+1]
-                for patch in image_extractor(temp_data):
+                for patch in image_extractor(temp_data, patch_size):
                     if idx >= num_chunks and num_chunks > 0: # 增加 num_chunks > 0 判断，方便全量训练
                         return
                     yield patch, img_id
                     idx += 1
         else:
             # 整体 RGB 处理 (H, W, 3) -> (16, 16, 3) patches
-            for patch in image_extractor(data):
+            for patch in image_extractor(data, patch_size):
                 if idx >= num_chunks and num_chunks > 0:
                     return
                 yield patch, img_id

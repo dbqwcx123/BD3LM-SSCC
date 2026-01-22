@@ -1,9 +1,10 @@
-python text_decompress_bd3lm.py \
+python image_compress_bd3lm.py \
     algo.backbone=hf_dit \
-    algo.T=10 \
+    algo.T=3 \
     sampling.first_hitting=False \
+    sampling.reset_channel_context=True \
     model.length=1024 \
     block_size=16 \
-    eval.checkpoint_path=/mnt/e/1Master1/0Science_Research/0DLM-SSCC/Model/bd3lm/bd3lm-owt-block_size16 \
+    data.test_dataset=CIFAR10 \
+    data.num_images_test=1 \
     model.attn_backend=sdpa \
-    training.ema=0

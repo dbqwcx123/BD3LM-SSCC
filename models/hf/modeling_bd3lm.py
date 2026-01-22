@@ -181,7 +181,7 @@ class LayerNorm(nn.Module):
     self.weight = nn.Parameter(torch.ones([dim]))
     self.dim = dim
   def forward(self, x):
-    with torch.cuda.amp.autocast(enabled=False):
+    with torch.amp.autocast('cuda', enabled=False):
       x = F.layer_norm(x.float(), [self.dim])
     return x * self.weight[None,None,:]
 
@@ -352,7 +352,7 @@ class DDiTBlock(nn.Module):
       'b s (three h d) -> b s three h d',
       three=3,
       h=self.n_heads)
-    with torch.cuda.amp.autocast(enabled=False):
+    with torch.amp.autocast('cuda', enabled=False):
       cos, sin = rotary_cos_sin
       qkv = apply_rotary_pos_emb_torchscript(
         qkv, cos.to(qkv.dtype), sin.to(qkv.dtype))
@@ -568,7 +568,7 @@ class DITBackbone(nn.Module):
       mask = None
       rotary_cos_sin = self.rotary_emb(x)
 
-    with torch.cuda.amp.autocast(dtype=self.precision):
+    with torch.amp.autocast('cuda', dtype=self.precision):
       for i in range(len(self.blocks)):
         x = self.blocks[i](x, 
                            rotary_cos_sin,
