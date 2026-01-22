@@ -96,7 +96,6 @@ def compress_semi_ar(model, tokenizer, config, full_input_ids, device):
                 break
                 
             t = timesteps[i]  # 当前时间步
-            
             # 计算噪声水平 Sigma
             _, move_chance_t = model.noise(t)
             sigma = model._sigma_from_p(move_chance_t).to(device)

@@ -15,6 +15,7 @@ data:
   train: openwebtext-train
   valid: openwebtext-valid
   tokenizer_name_or_path: /mnt/e/1Master1/0Science_Research/0DLM-SSCC/Model/gpt2
+  test_dataset_path: /mnt/e/1Master1/0Science_Research/0DLM-SSCC/Dataset/CIFAR10/cifar10_test
 
 loader:
   eval_batch_size: 1  # fixed in generate
@@ -27,6 +28,7 @@ sampling:
   nucleus_p: 1
   first_hitting: True # should be set to true when T >> block_size
   kv_cache: True
+  reset_channel_context: False
 
 trainer:
   devices: ${device_count:}
