@@ -270,7 +270,7 @@ def run_decompression_pipeline(model, tokenizer, config, device):
     
     # 计算总行数是否符合预期
     total_lines = len(lines)
-    assert total_lines // num_patches_per_img == num_images
+    assert total_lines == num_images
     
     print(f"Total Lines: {total_lines}")
     print(f"Image Size: {img_size}x{img_size}, Patch Size: {patch_size}")
@@ -282,44 +282,38 @@ def run_decompression_pipeline(model, tokenizer, config, device):
     completed_images_count = 0
     
     # 3. 外层循环：按 Image Group 遍历
-    lines_per_group = batch_size * num_patches_per_img
+    lines_per_group = batch_size
     for group_start in range(0, total_lines, lines_per_group):
         group_end = min(group_start + lines_per_group, total_lines)
         group_lines = lines[group_start:group_end]
-        current_bs = len(group_lines) // num_patches_per_img
+        current_bs = len(group_lines)
         if current_bs == 0: break
         print(f"Processing Image Group: {completed_images_count}-{completed_images_count + current_bs}...")
         
         # A. 重置 KV Cache (Image-Level Batching: 每一组新图开始时重置)
-        model.backbone.reset_kv_cache(bs=current_bs)
+        model.backbone.reset_kv_cache(eval_batch_size=current_bs)
         
-        # 初始化当前组的图片 Buffer，存储当前 Batch 中第 b 张图的所有像素
+        # 初始化该 Batch 的 Decoders
         batch_pixel_buffers = [[] for _ in range(current_bs)]
+        decoders = []
+        for line in group_lines:
+            # 移除 Stop Bit '1'
+            if not line: bit_string = ""
+            elif line[-1] == '1': bit_string = line[:-1]
+            else: bit_string = line 
+            
+            decoders.append(arithmetic_coder.Decoder(
+                base=config.data.ac_coder_base,
+                precision=config.data.ac_coder_precision,
+                input_fn=make_input_fn(bit_string)
+            ))
         
         # B. 遍历 Patch (Stream Processing)
         for p_idx in tqdm(range(num_patches_per_img), desc="Decoding Patches"):
             # Channel Switch Reset Logic
             if is_channel_wised and p_idx > 0 and (p_idx % patches_per_channel == 0):
                  if config.sampling.reset_channel_context:
-                     model.backbone.reset_kv_cache(bs=current_bs)
-            
-            # 获取当前 Patch 的比特流数据
-            batch_lines_start = p_idx * current_bs
-            batch_lines = group_lines[batch_lines_start : batch_lines_start + current_bs]
-            
-            # 初始化该 Batch 的 Decoders
-            decoders = []
-            for line in batch_lines:
-                # 移除 Stop Bit '1'
-                if not line: bit_string = ""
-                elif line[-1] == '1': bit_string = line[:-1]
-                else: bit_string = line # 异常情况容错
-                
-                decoders.append(arithmetic_coder.Decoder(
-                    base=config.data.ac_coder_base,
-                    precision=config.data.ac_coder_precision,
-                    input_fn=make_input_fn(bit_string)
-                ))
+                     model.backbone.reset_kv_cache(eval_batch_size=current_bs)
             
             # --- 核心解压 ---
             # filled_tokens: [Batch, Block_Size]
