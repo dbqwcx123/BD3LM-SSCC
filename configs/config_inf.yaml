@@ -14,8 +14,8 @@ block_size: 16
 data:
   dataset_root: /mnt/e/1Master1/0Science_Research/0DLM-SSCC/Dataset
   test_dataset: CIFAR10
-  num_images_test: 1
   image_size_test: 32
+  num_images_test: 1
   is_channel_wised: True  # RGB False; Gray True
   patch_size: ${sqrt:${block_size}}
   num_patches_test: ${compute_num_patches:${data.num_images_test},${data.image_size_test},${data.patch_size}}
@@ -26,7 +26,8 @@ data:
 sampling:
   checkpoint_path: /mnt/e/1Master1/0Science_Research/0DLM-SSCC/Model/bd3lm/bd3lm-owt-block_size${block_size}
   noise_removal: False
-  num_sample_batches: 1  # Total samples: `num_gpus` * `loader.eval_batch_size` * num_sample_batches
+  batch_size: 1
+  num_sample_batches: -1  # Total samples: `num_gpus` * `loader.eval_batch_size` * num_sample_batches
   var_length: False
   logdir: ./samples_${algo.name}_len${model.length}_blocksize${block_size}
   nucleus_p: 1
