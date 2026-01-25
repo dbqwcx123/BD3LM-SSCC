@@ -266,6 +266,7 @@ class Diffusion(L.LightningModule):
 
     if self.cross_attn:
       x = x[:, :self.config.model.length]
+      logits = logits[:, :self.config.model.length, :]
     # self.parameterization == 'subs':
     return self._subs_parameterization(logits=logits, xt=x)
     # return logits
