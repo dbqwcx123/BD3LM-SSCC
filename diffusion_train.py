@@ -16,7 +16,6 @@ import numpy as np
 import itertools
 import math
 
-# import data_loaders
 import metrics
 import models
 import noise_schedule
@@ -148,41 +147,10 @@ class Diffusion(L.LightningModule):
     if isinstance(first_loader.dataset, torch.utils.data.IterableDataset):
         print("Detected IterableDataset. Skipping FaultTolerantSampler injection.")
         return
-    # Adapted from:
-    # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/datamodules/language_modeling_hf.py
-    distributed = (
-      self.trainer._accelerator_connector.use_distributed_sampler
-      and self.trainer._accelerator_connector.is_distributed)
-    import data_loaders
-    if distributed:
-      sampler_cls = data_loaders.FaultTolerantDistributedSampler
     else:
-      sampler_cls = data_loaders.RandomFaultTolerantSampler
-    updated_dls = []
-    for dl in self.trainer.fit_loop._combined_loader.flattened:
-      if hasattr(dl.sampler, 'shuffle'):
-        dl_sampler = sampler_cls(
-          dl.dataset, shuffle=dl.sampler.shuffle)
-      else:
-        dl_sampler = sampler_cls(dl.dataset)
-      if (distributed
-          and self.fast_forward_epochs is not None
-          and self.fast_forward_batches is not None):
-        dl_sampler.load_state_dict({
-          'epoch': self.fast_forward_epochs,
-          'counter': (self.fast_forward_batches
-                      * self.config.loader.batch_size)})
-      updated_dls.append(
-        torch.utils.data.DataLoader(
-          dl.dataset,
-          batch_size=self.config.loader.batch_size,
-          num_workers=self.config.loader.num_workers,
-          pin_memory=self.config.loader.pin_memory,
-          sampler=dl_sampler,
-          shuffle=False,
-          persistent_workers=True))
-    self.trainer.fit_loop._combined_loader.flattened = updated_dls
-
+      print("No IterableDataset Detected.")
+      return -1
+      
   def on_train_epoch_start(self):
     self.backbone.train()
     self.noise.train()
@@ -424,93 +392,30 @@ class Diffusion(L.LightningModule):
       return True # nll (block size 1)
     return False # not a valid elbo (biased estimate)
 
-  def _resample_q_xt(
-      self, x, xt, move_indices, p, block_size, sampling_eps_min, sampling_eps_max):
-    """Resamples x_t if the percentage of masked tokens is outside the bounds
-    defined by sampling_eps_min and sampling_eps_max."""
-    perc_masked = (xt == self.mask_index).float().sum(-1) / block_size
-    while (perc_masked < sampling_eps_min).any() or \
-      (perc_masked > sampling_eps_max).any():
-      # if a bound is epsilon, don't resample
-      if sampling_eps_min == 1e-3 and sampling_eps_max != 1:
-        regen_idx = (perc_masked > sampling_eps_max)
-        if regen_idx.max() == 0:
-          break
-      elif sampling_eps_min != 1e-3 and sampling_eps_max == 1:
-        regen_idx = (perc_masked < sampling_eps_min)
-        if regen_idx.max() == 0:
-          break
-      elif sampling_eps_min != 1e-3 and sampling_eps_max != 1:
-        regen_idx = (perc_masked < sampling_eps_min) | (perc_masked > sampling_eps_max)
-      regen_idx = regen_idx.repeat_interleave(block_size,dim=-1)
-      move_indices[regen_idx] = (torch.rand(
-        * x.shape, device=x.device) < p)[regen_idx]
-      xt = torch.where(move_indices, self.mask_index, x)
-      xt = xt.reshape(xt.shape[0], -1, block_size)
-      perc_masked = (xt == self.mask_index).float().sum(-1) / block_size
-    return xt
-  
-  def q_xt(
-      self, x, p, block_size=None, sampling_eps_min=None, sampling_eps_max=None):
-    """Computes the noisy sample xt.
-
-    Args:
-      x: int torch.Tensor with shape (batch_size,
-          diffusion_model_input_length), input. 
-      p: float torch.Tensor with shape (batch_size, 1).
-      block_size: int, block size.
-      sampling_eps_min: float, minimum percentage of masked tokens.
-      sampling_eps_max: float, maximum percentage of masked tokens.
-    """
-    if block_size is None:
-      block_size = self.block_size
-  
-    move_indices = torch.rand(
-      * x.shape, device=x.device) <= p
-    xt = torch.where(move_indices, self.mask_index, x)
-
-    if block_size == 1 and sampling_eps_min == 1.0:
-      return torch.full_like(x, self.mask_index)
-
-    # no need to resample for bounds 1e-3, 1
-    if self.config.training.resample and \
-      not (sampling_eps_min == 1e-3 and sampling_eps_max == 1.0):
-      xt = xt.reshape(xt.shape[0], -1, block_size)
-      xt = self._resample_q_xt(x,
-                               xt,
-                               move_indices,
-                               p,
-                               block_size,
-                               sampling_eps_min,
-                               sampling_eps_max)
-      xt = xt.reshape(xt.shape[0], -1)
-    return xt
-
-  def _sigma_from_p(self, p):
-    return torch.min(- torch.log(1 - p), self.noise.sigma_max)
-
-  def _sample_t(
-      self, batch_dims, device, sampling_eps_min, sampling_eps_max, block_size=None):
-    if block_size is None:
-      block_size = self.block_size
-    n = batch_dims[-1]
-    num_blocks = n // block_size
-    _eps_b = torch.rand((batch_dims[0], num_blocks), device=device)
-
-    # antithetic sampling along blocks & batches (for uniform sampling)
-    if self.antithetic_sampling:
-      offset_b = torch.arange(batch_dims[0] * num_blocks, device=device) / (batch_dims[0] * num_blocks)
-      offset_b = offset_b.view(batch_dims[0], num_blocks)
-      _eps_b = (_eps_b / (batch_dims[0] * num_blocks) + offset_b) % 1
-    t = _eps_b
-    if block_size != self.config.model.length:
-      t = t.repeat_interleave(block_size, dim=-1)
-
-    # nll
-    if sampling_eps_max >= 1 and sampling_eps_min >= 1:
-      return torch.ones_like(t)
-    t = t * (sampling_eps_max - sampling_eps_min) + sampling_eps_min
-    return t
+  def _loss(self, x0, attention_mask, t=None, sampling_eps_min=None, sampling_eps_max=None):
+    if sampling_eps_min is None and hasattr(self, 'sampling_eps_min'):
+      sampling_eps_min = self.sampling_eps_min
+      sampling_eps_max = self.sampling_eps_max
+    elif not hasattr(self, 'sampling_eps_min'):
+      sampling_eps_min = 1e-3
+      sampling_eps_max = 1.0
+    (input_tokens, output_tokens,
+     attention_mask) = self._maybe_sub_sample(
+       x0, attention_mask)
+    # self.parameterization == 'subs':
+    loss = self._forward_pass_diffusion(
+      input_tokens,
+      sampling_eps_min=sampling_eps_min,
+      sampling_eps_max=sampling_eps_max,)
+    
+    if self.ignore_bos and not self.training:
+      attention_mask[:, 0] = 0
+      
+    nlls = (loss * attention_mask)
+    token_nll = nlls.sum() / attention_mask.sum()
+    return Loss(loss=token_nll,
+                nlls=nlls,
+                token_mask=attention_mask)
 
   def _maybe_sub_sample(self, x0, attention_mask):
     seqlen = x0.shape[1]
@@ -564,31 +469,94 @@ class Diffusion(L.LightningModule):
     loss = loss_scale * log_p_theta
     return loss
 
-  def _loss(self, x0, attention_mask, t=None, sampling_eps_min=None, sampling_eps_max=None):
-    if sampling_eps_min is None and hasattr(self, 'sampling_eps_min'):
-      sampling_eps_min = self.sampling_eps_min
-      sampling_eps_max = self.sampling_eps_max
-    elif not hasattr(self, 'sampling_eps_min'):
-      sampling_eps_min = 1e-3
-      sampling_eps_max = 1.0
-    (input_tokens, output_tokens,
-     attention_mask) = self._maybe_sub_sample(
-       x0, attention_mask)
-    # self.parameterization == 'subs':
-    loss = self._forward_pass_diffusion(
-      input_tokens,
-      sampling_eps_min=sampling_eps_min,
-      sampling_eps_max=sampling_eps_max,)
-    
-    if self.ignore_bos and not self.training:
-      attention_mask[:, 0] = 0
-      
-    nlls = (loss * attention_mask)
-    token_nll = nlls.sum() / attention_mask.sum()
-    return Loss(loss=token_nll,
-                nlls=nlls,
-                token_mask=attention_mask)
+  def _sample_t(
+      self, batch_dims, device, sampling_eps_min, sampling_eps_max, block_size=None):
+    if block_size is None:
+      block_size = self.block_size
+    n = batch_dims[-1]
+    num_blocks = n // block_size
+    _eps_b = torch.rand((batch_dims[0], num_blocks), device=device)
 
+    # antithetic sampling along blocks & batches (for uniform sampling)
+    if self.antithetic_sampling:
+      offset_b = torch.arange(batch_dims[0] * num_blocks, device=device) / (batch_dims[0] * num_blocks)
+      offset_b = offset_b.view(batch_dims[0], num_blocks)
+      _eps_b = (_eps_b / (batch_dims[0] * num_blocks) + offset_b) % 1
+    t = _eps_b
+    if block_size != self.config.model.length:
+      t = t.repeat_interleave(block_size, dim=-1)
+
+    # nll
+    if sampling_eps_max >= 1 and sampling_eps_min >= 1:
+      return torch.ones_like(t)
+    t = t * (sampling_eps_max - sampling_eps_min) + sampling_eps_min
+    return t
+
+  def _sigma_from_p(self, p):
+    return torch.min(- torch.log(1 - p), self.noise.sigma_max)
+
+  def q_xt(
+      self, x, p, block_size=None, sampling_eps_min=None, sampling_eps_max=None):
+    """Computes the noisy sample xt.
+
+    Args:
+      x: int torch.Tensor with shape (batch_size,
+          diffusion_model_input_length), input. 
+      p: float torch.Tensor with shape (batch_size, 1).
+      block_size: int, block size.
+      sampling_eps_min: float, minimum percentage of masked tokens.
+      sampling_eps_max: float, maximum percentage of masked tokens.
+    """
+    if block_size is None:
+      block_size = self.block_size
+  
+    move_indices = torch.rand(
+      * x.shape, device=x.device) <= p
+    xt = torch.where(move_indices, self.mask_index, x)
+
+    if block_size == 1 and sampling_eps_min == 1.0:
+      return torch.full_like(x, self.mask_index)
+
+    # no need to resample for bounds 1e-3, 1
+    if self.config.training.resample and \
+      not (sampling_eps_min == 1e-3 and sampling_eps_max == 1.0):
+      xt = xt.reshape(xt.shape[0], -1, block_size)
+      xt = self._resample_q_xt(x,
+                               xt,
+                               move_indices,
+                               p,
+                               block_size,
+                               sampling_eps_min,
+                               sampling_eps_max)
+      xt = xt.reshape(xt.shape[0], -1)
+    return xt
+
+  def _resample_q_xt(
+      self, x, xt, move_indices, p, block_size, sampling_eps_min, sampling_eps_max):
+    """Resamples x_t if the percentage of masked tokens is outside the bounds
+    defined by sampling_eps_min and sampling_eps_max."""
+    perc_masked = (xt == self.mask_index).float().sum(-1) / block_size
+    while (perc_masked < sampling_eps_min).any() or \
+      (perc_masked > sampling_eps_max).any():
+      # if a bound is epsilon, don't resample
+      if sampling_eps_min == 1e-3 and sampling_eps_max != 1:
+        regen_idx = (perc_masked > sampling_eps_max)
+        if regen_idx.max() == 0:
+          break
+      elif sampling_eps_min != 1e-3 and sampling_eps_max == 1:
+        regen_idx = (perc_masked < sampling_eps_min)
+        if regen_idx.max() == 0:
+          break
+      elif sampling_eps_min != 1e-3 and sampling_eps_max != 1:
+        regen_idx = (perc_masked < sampling_eps_min) | (perc_masked > sampling_eps_max)
+      regen_idx = regen_idx.repeat_interleave(block_size,dim=-1)
+      move_indices[regen_idx] = (torch.rand(
+        * x.shape, device=x.device) < p)[regen_idx]
+      xt = torch.where(move_indices, self.mask_index, x)
+      xt = xt.reshape(xt.shape[0], -1, block_size)
+      perc_masked = (xt == self.mask_index).float().sum(-1) / block_size
+    return xt
+  
   def _clipped_schedule_search(self):
     # collect losses per batch across devices and sum them per interval
     best_var = float('inf')

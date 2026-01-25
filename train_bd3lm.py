@@ -260,11 +260,6 @@ def _train(config, logger, tokenizer):
   
   logger.info(f'Loading pretrained model from {config.training.from_pretrained}')
   # load pretraining checkpoint (local)
-  # model = diffusion_train.Diffusion.load_from_checkpoint(
-  #   config.training.from_pretrained,
-  #   tokenizer=tokenizer,
-  #   config=config,
-  #   strict=False)
   model = diffusion_train.Diffusion(config=config, tokenizer=tokenizer)
   # add buffers for grid search
   model.register_buffer('sampling_eps_min', torch.tensor(
