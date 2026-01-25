@@ -93,10 +93,8 @@ class Div2kPatchDataset(IterableDataset):
       # --- 训练集启用数据增广 ---
       if split == 'train':
         self.transform = transforms.Compose([
-          # 核心修改：随机缩放并裁剪
-          # scale=(0.08, 1.0) 表示模型会随机看到从“局部 8% 面积”到“全图 100% 面积”的视野
-          # 这样既包含了高分辨率的 Patch (局部)，也模拟了低分辨率的缩略图 (全局)
-          transforms.RandomResizedCrop(size=(32, 32), scale=(0.08, 1.0), ratio=(0.75, 1.33)),
+          # 改为 RandomCrop，保留原始分辨率特征，也符合 Block 处理逻辑
+          transforms.RandomCrop(size=(32, 32)),
           transforms.RandomHorizontalFlip(p=0.5),
           transforms.RandomVerticalFlip(p=0.5),
         ])
@@ -298,7 +296,7 @@ def _train(config, logger, tokenizer):
 def main(config):
   """Main entry point for training."""
   L.seed_everything(config.seed)
-  _print_config(config, resolve=True, save_cfg=True)
+  # _print_config(config, resolve=True, save_cfg=True)
   
   logger = utils.get_logger(__name__)
   tokenizer = utils.get_tokenizer(config)

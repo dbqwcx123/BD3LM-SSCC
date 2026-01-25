@@ -15,7 +15,7 @@ seed: 42
 block_size: ${model.length}
 
 loader:
-  data_dir: /mnt/e/1Master1/0Science_Research/0DLM-SSCC/Dataset/DIV2K/DIV2K_HR_p128
+  data_dir: /mnt/e/1Master1/0Science_Research/0DLM-SSCC/Dataset/DIV2K/DIV2K_HR_unified
   global_batch_size: 512
   eval_global_batch_size: ${.global_batch_size}
   # Note: batch_size and eval_batch_size are **per machine**

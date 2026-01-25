@@ -1,5 +1,5 @@
 python train_bd3lm.py \
-    loader.data_dir=/mnt/e/1Master1/0Science_Research/0DLM-SSCC/Dataset/DIV2K/DIV2K_HR_unified\
+    loader.data_dir=/mnt/e/1Master1/0Science_Research/0DLM-SSCC/Dataset/DIV2K/DIV2K_LR_unified/X4\
     loader.global_batch_size=128 \
     loader.eval_global_batch_size=128 \
     loader.batch_size=4 \
