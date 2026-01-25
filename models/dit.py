@@ -4,11 +4,6 @@ import typing
 import einops
 from einops import rearrange
 from functools import partial
-try:
-  import flash_attn
-  import flash_attn.layers.rotary
-except:
-  pass
 import huggingface_hub
 import omegaconf
 import torch
@@ -166,44 +161,8 @@ def rotate_half(x):
   x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
   return torch.cat((-x2, x1), dim=-1)
 
-
-def split_and_apply_rotary_pos_emb(qkv, rotary_cos_sin):
-  with torch.amp.autocast('cuda', enabled=False):
-    cos, sin = rotary_cos_sin
-    cos = cos.to(qkv.dtype)
-    sin = sin.to(qkv.dtype)
-    cos = cos[0,:,0,0,:cos.shape[-1]//2]
-    sin = sin[0,:,0,0,:sin.shape[-1]//2]
-    q, k, v = qkv.chunk(3, dim=2)
-    q = flash_attn.layers.rotary.apply_rotary_emb_torch(
-      q.squeeze(dim=2), cos, sin)
-    k = flash_attn.layers.rotary.apply_rotary_emb_torch(
-      k.squeeze(dim=2), cos, sin)
-    v = v.squeeze(dim=2)
-  return q, k, v
-
 def apply_rotary_pos_emb_torchscript(qkv, cos, sin):
     return (qkv * cos) + (rotate_half(qkv) * sin)
-
-def apply_rotary_pos_emb(qkv, cos, sin):
-  cos = cos[0,:,0,0,:cos.shape[-1]//2]
-  sin = sin[0,:,0,0,:sin.shape[-1]//2]
-  return flash_attn.layers.rotary.apply_rotary_emb_qkv_(qkv, cos, sin)
-
-
-def regular_attention_multi_headed(q, k, v):
-  # Assuming qkv is a tensor with shape [batch, seq_len, 3, num_heads, head_dim]
-  # where the 3 represents Q, K, V packed in that order
-  attention_output = F.scaled_dot_product_attention(
-    query=q.transpose(1, 2),
-    key=k.transpose(1, 2),
-    value=v.transpose(1, 2),
-    attn_mask=None,
-    dropout_p=0.0,
-    is_causal=False)
-  # [batch_size, seq_len, num_heads, head_dim]
-  attention_output = attention_output.transpose(1, 2)
-  return einops.rearrange(attention_output, 'b s h d -> b s (h d)')
 
 
 #################################################################################
@@ -296,147 +255,12 @@ class LabelEmbedder(nn.Module):
 #                                 Core Model                                    #
 #################################################################################
 
-class DDiTBlockCausal(nn.Module):
-  def __init__(self, n, dim, n_heads, mlp_ratio=4, dropout=0.1, max_batch_size=64, max_seqlen=1024, adaLN=False, cond_dim=None, attn_backend='flash_attn'):
-    super().__init__()
-    self.n_heads = n_heads
-    self.max_seqlen = max_seqlen
-    self.n = n
-
-    self.norm1 = LayerNorm(dim)
-    self.attn_qkv = nn.Linear(dim, 3 * dim, bias=False)
-    self.attn_out = nn.Linear(dim, dim, bias=False)
-    self.dropout1 = nn.Dropout(dropout)
-
-    self.norm2 = LayerNorm(dim)
-    self.mlp = nn.Sequential(
-      nn.Linear(dim, mlp_ratio * dim, bias=True),
-      nn.GELU(approximate='tanh'),
-      nn.Linear(mlp_ratio * dim, dim, bias=True))
-    self.dropout2 = nn.Dropout(dropout)
-    self.dropout = dropout
-    self.adaLN = adaLN
-    if self.adaLN:
-      self.adaLN_modulation = nn.Linear(cond_dim, 6 * dim)
-      self.adaLN_modulation.weight.data.zero_()
-      self.adaLN_modulation.bias.data.zero_()
-    self.attn_backend = attn_backend
-    self.kv_cache = None
-
-  def _get_bias_dropout_scale(self):
-    if self.training:
-      return bias_dropout_add_scale_fused_train
-    else:
-      return bias_dropout_add_scale_fused_inference
-
-  def get_qkv(self, x, rotary_cos_sin, store_kv=False):
-    # compute qkv (potentially use cache)
-    if self.kv_cache is not None:
-      new_qkv = self.attn_qkv(x[:, -1:])
-      qkv = torch.cat((self.kv_cache, new_qkv), dim=1)
-    else:
-      qkv = self.attn_qkv(x)
-    # store kv cache in a sliding window (can't exceed context len)
-    if store_kv:
-      self.kv_cache = qkv[:, -(self.max_seqlen-1):].clone()
-      
-    qkv = einops.rearrange(
-      qkv,
-      'b s (three h d) -> b s three h d',
-      three=3,
-      h=self.n_heads)
-    with torch.amp.autocast('cuda', enabled=False):
-      cos, sin = rotary_cos_sin
-      if self.attn_backend == 'flash_attn':
-        qkv = apply_rotary_pos_emb(
-          qkv, cos.to(qkv.dtype), sin.to(qkv.dtype))
-      else:
-        qkv = apply_rotary_pos_emb_torchscript(
-          qkv, cos.to(qkv.dtype), sin.to(qkv.dtype))
-          
-    return qkv
-
-  def cross_attn(self, qkv, mask=None):
-    scale = qkv.shape[-1]
-    qkv = qkv.transpose(1, 3)
-    mask = mask.bool() if mask is not None else None
-    x = F.scaled_dot_product_attention(
-      query=qkv[:, :, 0],
-      key=qkv[:, :, 1],
-      value=qkv[:, :, 2],
-      attn_mask=mask,
-      is_causal=True,
-      scale=1 / math.sqrt(scale))
-    x = x.transpose(1, 2)
-    x = rearrange(x, 'b s h d -> b s (h d)')
-    return x
-
-  def forward(self,
-              x,
-              rotary_cos_sin,
-              c=None,
-              causal=True,
-              mask=None,
-              store_kv=False,
-              **kwargs):
-    del kwargs
-    batch_size, seq_len = x.shape[0], x.shape[1]
-    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = None, None, None, None, None, None
-    bias_dropout_scale_fn = self._get_bias_dropout_scale()
-    if c is not None and c.shape[0] == batch_size:
-      (shift_msa, scale_msa, gate_msa, shift_mlp,
-      scale_mlp, gate_mlp) = self.adaLN_modulation(c)[:, None].chunk(6, dim=2)
-    elif c is not None:
-      (shift_msa, scale_msa, gate_msa, shift_mlp,
-      scale_mlp, gate_mlp) = rearrange(
-        self.adaLN_modulation(c), '(b h) d -> b h d', b=batch_size
-        ).chunk(6, dim=-1)
-
-    # attention operation
-    x_skip = x
-    if c is not None:
-      x = modulate_fused(self.norm1(x), shift_msa, scale_msa)
-    else:
-      x = self.norm1(x)
-    
-    qkv = self.get_qkv(x, rotary_cos_sin, store_kv=store_kv)
-    if self.attn_backend == 'flash_attn':
-      qkv = einops.rearrange(qkv, 'b s ... -> (b s) ...')
-      cu_seqlens = torch.arange(
-        0, (batch_size + 1) * seq_len,
-        step=seq_len, dtype=torch.int32, device=qkv.device)
-      x = flash_attn.flash_attn_interface.flash_attn_varlen_qkvpacked_func(
-        qkv, cu_seqlens, seq_len, 0.0, causal=True)
-      x = einops.rearrange(x, '(b s) h d -> b s (h d)', b=batch_size)
-    else:
-      x = self.cross_attn(qkv, c)
-      
-    if c is not None:
-      x = bias_dropout_scale_fn(self.attn_out(x),
-        None,
-        gate_msa,
-        x_skip,
-        self.dropout)
-      # mlp operation
-      x = bias_dropout_scale_fn(
-        self.mlp(modulate_fused(
-          self.norm2(x), shift_mlp, scale_mlp)),
-        None, gate_mlp, x, self.dropout)
-    else:
-      scale = torch.ones(1, device=x.device, dtype=x.dtype)
-      x = bias_dropout_scale_fn(
-        self.attn_out(x), None, scale, x_skip, self.dropout)
-      x = bias_dropout_scale_fn(
-        self.mlp(self.norm2(x)), None, scale, x, self.dropout)
-    return x
-
-
 class DDiTBlock(nn.Module):
   def __init__(self, n, dim, n_heads, adaLN,
                latent_dim=None, cond_dim=None,
                latent_conditioning=-1, mlp_ratio=4,
                dropout=0.1, block_size=1,
-               max_batch_size=64, max_seqlen=1024, attn_backend='flash_attn'):
+               max_batch_size=64, max_seqlen=1024, attn_backend='flex'):
     super().__init__()
     self.max_seqlen = max_seqlen
     self.n = n
@@ -495,12 +319,8 @@ class DDiTBlock(nn.Module):
       h=self.n_heads)
     with torch.amp.autocast('cuda', enabled=False):
       cos, sin = rotary_cos_sin
-      if self.attn_backend == 'flash_attn':
-        qkv = apply_rotary_pos_emb(
-          qkv, cos.to(qkv.dtype), sin.to(qkv.dtype))
-      else:
-        qkv = apply_rotary_pos_emb_torchscript(
-          qkv, cos.to(qkv.dtype), sin.to(qkv.dtype))
+      qkv = apply_rotary_pos_emb_torchscript(
+        qkv, cos.to(qkv.dtype), sin.to(qkv.dtype))
     return qkv
   
   def attn_mlp(self, x, c, gate_msa, gate_mlp, shift_mlp, scale_mlp, x_skip):
@@ -581,15 +401,7 @@ class DDiTBlock(nn.Module):
       qkv = self.get_qkv(x, rotary_cos_sin, store_kv=store_kv)
       
     # attention
-    if self.attn_backend == 'flash_attn' and mask is None:
-      qkv = einops.rearrange(qkv, 'b s ... -> (b s) ...')
-      cu_seqlens = torch.arange(
-        0, (batch_size + 1) * seq_len, step=seq_len,
-        dtype=torch.int32, device=qkv.device)
-      x = flash_attn.flash_attn_interface.flash_attn_varlen_qkvpacked_func(
-        qkv, cu_seqlens, seq_len, 0., causal=causal)
-      x = rearrange(x, '(b s) h d -> b s (h d)', b=batch_size)     
-    elif self.attn_backend == 'flex' and FLEX_ATTN_AVAILABLE:
+    if self.attn_backend == 'flex' and FLEX_ATTN_AVAILABLE:
       x = self.cross_attn_flex(qkv, mask=mask)
     elif self.attn_backend == 'sdpa':
       x = self.cross_attn(qkv, mask=mask)
@@ -660,32 +472,21 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     if not self.causal:
       self.sigma_map = TimestepEmbedder(cond_dim)
     self.rotary_emb = Rotary(dim // config.model.n_heads)
-    self.attn_backend = getattr(config.model, 'attn_backend', 'flash_attn')
+    self.attn_backend = getattr(config.model, 'attn_backend', 'flex')
     self.max_seqlen = 1024
 
     blocks = []
     for _ in range(config.model.n_blocks):
-      if self.causal:
-        block = DDiTBlockCausal(
-          n=config.model.length,
-          dim=dim,
-          n_heads=config.model.n_heads,
-          dropout=config.model.dropout,
-          max_batch_size=config.loader.eval_batch_size,
-          adaLN=self.adaLN,
-          cond_dim=cond_dim,
-          attn_backend=self.attn_backend)
-      else:
-        block = DDiTBlock(
-          n=config.model.length,
-          dim=dim,
-          n_heads=config.model.n_heads,
-          cond_dim=cond_dim,
-          adaLN=self.adaLN,
-          dropout=config.model.dropout,
-          block_size=self.block_size,
-          attn_backend=self.attn_backend,
-          max_seqlen=self.max_seqlen)
+      block = DDiTBlock(
+        n=config.model.length,
+        dim=dim,
+        n_heads=config.model.n_heads,
+        cond_dim=cond_dim,
+        adaLN=self.adaLN,
+        dropout=config.model.dropout,
+        block_size=self.block_size,
+        attn_backend=self.attn_backend,
+        max_seqlen=self.max_seqlen)
       blocks.append(block)
     self.blocks = nn.ModuleList(blocks)
     self.output_layer = DDiTFinalLayer(
