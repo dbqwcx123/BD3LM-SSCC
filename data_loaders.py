@@ -32,6 +32,9 @@ import matplotlib.pyplot as plt
 import sys
 import torchvision
 
+import torch
+import typing
+import math
 
 def _extract_image_patches(image: np.ndarray, patch_size: int) -> Iterator[bytes]:
     h, w = patch_size, patch_size
@@ -137,3 +140,104 @@ def patch_visualize(patch_data, save_path, patch_name):
     img = Image.fromarray(patch_data, mode='RGB')
     img.save(f'{save_path}/patch{patch_name}.png')
     plt.close()
+
+class RandomFaultTolerantSampler(torch.utils.data.RandomSampler):
+
+  def __init__(self, *args, generator=None, **kwargs):
+    # TD [2022-07-17]: We don't force the seed to be zero. We generate random seed,
+    # which should be reproducible if pl.seed_everything was called beforehand.
+    # This means that changing the seed of the experiment will also change the
+    # sampling order.
+    if generator is None:
+      seed = int(torch.empty((), dtype=torch.int64).random_().item())
+      generator = torch.Generator().manual_seed(seed)
+    kwargs.pop('shuffle', None)
+    super().__init__(*args, generator=generator, **kwargs)
+    self.counter = 0
+    self.restarting = False
+
+  def state_dict(self):
+    return {'random_state': self.generator.get_state(),
+            'counter': self.counter}
+
+  def load_state_dict(self, state_dict):
+    self.generator.set_state(state_dict.get('random_state'))
+    self.counter = state_dict['counter']
+    # self.start_counter = self.counter
+    self.restarting = True
+
+  # TD [2022-08-28] Setting the len will cause PL to think there are only a few batches left per
+  # epoch, and subsequent epoch will have very few batches.
+
+  def __iter__(self) -> typing.Iterator[int]:
+    n = len(self.data_source)
+
+    self.state = self.generator.get_state()
+    indices = torch.randperm(n, generator=self.generator).tolist()
+
+    if not self.restarting:
+      self.counter = 0
+    else:
+      indices = indices[self.counter:]
+      self.restarting = False
+
+    for index in indices:
+      self.counter += 1
+      yield index
+
+    self.counter = 0
+
+class FaultTolerantDistributedSampler(torch.utils.data.DistributedSampler):
+
+  def __init__(self, *args, **kwargs):
+    super().__init__(*args, **kwargs)
+    self.counter = 0
+    self.restarting = False
+
+  def state_dict(self):
+    return {'epoch': self.epoch, 'counter': self.counter}
+
+  def load_state_dict(self, state_dict):
+    self.epoch = state_dict['epoch']
+    self.counter = state_dict['counter']
+    self.restarting = True
+
+  # TD [2022-08-28] Setting the len will cause PL to think there are only a few batches left per
+  # epoch, and subsequent epoch will have very few batches.
+  def __iter__(self):
+    if self.shuffle:
+      # deterministically shuffle based on epoch and seed
+      g = torch.Generator()
+      g.manual_seed(self.seed + self.epoch)
+      indices = torch.randperm(len(self.dataset), generator=g).tolist()  # type: ignore[arg-type]
+    else:
+      indices = list(range(len(self.dataset)))  # type: ignore[arg-type]
+
+    if not self.drop_last:
+      # add extra samples to make it evenly divisible
+      padding_size = self.total_size - len(indices)
+      if padding_size <= len(indices):
+        indices += indices[:padding_size]
+      else:
+        indices += (indices * math.ceil(
+          padding_size / len(indices)))[:padding_size]
+    else:
+      # remove tail of data to make it evenly divisible.
+      indices = indices[:self.total_size]
+    assert len(indices) == self.total_size
+
+    # subsample
+    indices = indices[self.rank:self.total_size:self.num_replicas]
+    assert len(indices) == self.num_samples
+
+    if not self.restarting:
+      self.counter = 0
+    else:
+      indices = indices[self.counter:]
+      self.restarting = False
+
+    for index in indices:
+      self.counter += 1
+      yield index
+
+    self.counter = 0

@@ -34,10 +34,10 @@
       ]
     },
     {
-      "name": "调试 image_compress_bd3lm.py",
+      "name": "调试 compress",
       "type": "python",
       "request": "launch",
-      "program": "${workspaceFolder}/image_compress_bd3lm.py",
+      "program": "${workspaceFolder}/compress_optimized.py",
       "console": "integratedTerminal",
       "justMyCode": false,
       "env": {
@@ -48,11 +48,13 @@
       "args": [
         "algo.backbone=hf_dit",
         "algo.T=3",
-        "model.length=1024",
-        "block_size=16",
-        "model.attn_backend=sdpa",
         "sampling.first_hitting=False",
         "sampling.reset_channel_context=True",
+        "model.length=1024",
+        "block_size=16",
+        "data.test_dataset=CIFAR10",
+        "data.num_images_test=10",
+        "model.attn_backend=sdpa",
       ]
     },
     {
