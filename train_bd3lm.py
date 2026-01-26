@@ -231,7 +231,7 @@ def _train(config, logger, tokenizer):
   # train_ds, valid_ds = dataloader.get_dataloaders(config, tokenizer)
   
   train_set = Div2kPatchDataset(
-    data_path=os.path.join(config.loader.data_dir, "train_small"),
+    data_path=os.path.join(config.loader.data_dir, "train"),
     tokenizer=tokenizer,
     samples_per_image=1,
     is_channel_wised=config.data.is_channel_wised,

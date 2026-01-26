@@ -80,6 +80,22 @@ class Diffusion(L.LightningModule):
       self.config.training.sampling_eps_max))
     
     self.neg_infinity = -1000000.0
+    
+    # 1. 预计算 Pixel Token IDs 和 Vocab Map
+    pixel_ids_list = []
+    for i in range(256):
+        # 将 '0'-'255' 字符串转为对应的 ID
+        pixel_ids_list.append(self.tokenizer.convert_tokens_to_ids(str(i)))
+    
+    # 注册 buffer，会自动随模型移动到 GPU
+    self.register_buffer('pixel_token_ids', torch.tensor(pixel_ids_list, dtype=torch.long))
+    
+    # 创建全词表到 0-255 的映射表 (默认为 -1)
+    vocab_map_tensor = torch.full((self.vocab_size,), -1, dtype=torch.long)
+    for i, pid in enumerate(pixel_ids_list):
+        if pid < self.vocab_size:
+            vocab_map_tensor[pid] = i
+    self.register_buffer('vocab_map', vocab_map_tensor)
 
 # __init__方法中用到的自定义函数
   def _get_parameters(self):
@@ -142,16 +158,26 @@ class Diffusion(L.LightningModule):
     if not self.trainer.sanity_checking:
       print("\nSearching clipped schedule...\n")
       self._clipped_schedule_search()
+      
+      current_min = self.sampling_eps_min.item()
+      current_max = self.sampling_eps_max.item()
+      self.print(f"\n{'='*40}")
+      self.print(f"[Auto-Schedule] Epoch {self.current_epoch} Update:")
+      self.print(f"  New Sampling Interval: [{current_min:.4f}, {current_max:.4f}]")
+      self.print(f"{'='*40}\n")
+      
       self.log('sampling_eps_min',
                self.sampling_eps_min,
                on_epoch=True,
                on_step=False,
-               sync_dist=True)
+               sync_dist=True,
+               prog_bar=True)
       self.log('sampling_eps_max',
                self.sampling_eps_max,
                on_epoch=True,
                on_step=False,
-               sync_dist=True)
+               sync_dist=True,
+               prog_bar=True)
 
 ## CheckpointHooks
   def on_load_checkpoint(self, checkpoint):
@@ -280,22 +306,30 @@ class Diffusion(L.LightningModule):
     return checkpoint
 
   def _subs_parameterization(self, logits, xt):
-    # log prob at the mask index = - infinity
-    logits[:, :, self.mask_index] += self.neg_infinity
+    # 修改：实现限制域归一化 (Restricted Normalization)
+    # 1. 提取 0-255 对应的 logits [B, L, 256]
+    logits_pixel = logits[:, :, self.pixel_token_ids]
     
-    # Normalize the logits such that x.exp() is
-    # a probability distribution over vocab_size.
-    logits = logits - torch.logsumexp(logits, dim=-1,
+    # 2. 在 256 维上进行 LogSoftmax 归一化, 确保 sum(exp(logits_pixel)) = 1
+    logits_pixel = logits_pixel - torch.logsumexp(logits_pixel, dim=-1,
                                       keepdim=True)
     
-    # Apply updates directly in the logits matrix.
-    # For the logits of the unmasked tokens, set all values
-    # to -infinity except for the indices corresponding to
-    # the unmasked tokens.
+    # 3. 处理未 Mask 的位置 (Conditioning)
+    # 对于未被 Mask 的 Token，将其概率分布设为 One-hot (Log-prob 为 0)
     unmasked_indices = (xt != self.mask_index)
-    logits[unmasked_indices] = self.neg_infinity
-    logits[unmasked_indices, xt[unmasked_indices]] = 0
-    return logits
+    # 将 xt (Token ID) 映射回 Pixel Index (0-255)
+    xt_pixel_indices = self.vocab_map[xt]
+    
+    # 只有当：1. 未被 Mask  2. 且该位置确实是有效像素 Token 时，才应用强约束
+    valid_unmasked = unmasked_indices & (xt_pixel_indices != -1)
+    
+    if valid_unmasked.any():
+        # 将该位置所有类别的 log-prob 设为负无穷
+        logits_pixel[valid_unmasked] = self.neg_infinity
+        # 将该位置真实 Pixel 对应的 log-prob 设为 0
+        logits_pixel[valid_unmasked, xt_pixel_indices[valid_unmasked]] = 0
+        
+    return logits_pixel # 返回维度 [B, L, 256]
 
   def _process_sigma(self, sigma):
     # cause of overfitting for block size 1?
@@ -386,10 +420,25 @@ class Diffusion(L.LightningModule):
     model_output = self.forward(x_input, sigma=sigma)
     utils.print_nans(model_output, 'model_output')
 
+    # 修改：Loss 计算适配 256 维 logits 和 Mapping
+    # 1. 准备 Targets: 将 x0 (Token IDs) 映射为 0-255
+    target_pixel_indices = self.vocab_map[x0] # [B, L]
+    
+    # 2. 处理非像素 Token (如 x0 中可能包含非 0-255 的特殊 token)
+    # 创建一个用于 gather 的 safe indices (将 -1 替换为 0，随后用 mask 过滤)
+    gather_indices = target_pixel_indices.clone()
+    valid_target_mask = (target_pixel_indices != -1).float()
+    gather_indices[gather_indices == -1] = 0 
+    
+    # 3. Gather Log Probs
     log_p_theta = torch.gather(
       input=model_output,
       dim=-1,
-      index=x0[:, :, None]).squeeze(-1)
+      index=gather_indices[:, :, None]).squeeze(-1)
+    
+    # 4. 过滤无效 Target 的 Loss
+    log_p_theta = log_p_theta * valid_target_mask
+    
     weighted_loss = loss_scale * log_p_theta  # weighted cross entropy
     unweighted_loss = -log_p_theta
     

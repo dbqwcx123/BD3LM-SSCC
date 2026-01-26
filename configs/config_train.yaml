@@ -21,7 +21,7 @@ loader:
   # Note: batch_size and eval_batch_size are **per machine**
   batch_size: ${div_up:${.global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
   eval_batch_size: ${div_up:${.eval_global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
-  num_workers: 8
+  num_workers: 4
   pin_memory: True
 
 data:
@@ -52,11 +52,11 @@ trainer:
   gradient_clip_val: 1.0
   precision: 'bf16-mixed'
   num_sanity_val_steps: 2
-  max_steps: 10_000
+  max_steps: 100_000
   log_every_n_steps: 1
   limit_train_batches: 1.0   # train on full dataset, can be used to toggle quick run
   limit_val_batches: 1.0     # validate on full dataset, can be used to toggle quick run
-  val_check_interval: 0.5
+  val_check_interval: 0.25
 
 wandb:
   project: BD3-LMs
