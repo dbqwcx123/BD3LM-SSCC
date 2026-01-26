@@ -23,9 +23,10 @@ import utils
 
 @dataclass
 class Loss:
-  loss: torch.FloatTensor
-  nlls: torch.FloatTensor
-  token_mask: torch.FloatTensor
+  loss: torch.FloatTensor            # 用于反向传播的 Loss (Weighted CE)
+  nlls: torch.FloatTensor            # 用于 Metric 统计的 Weighted NLL Tensor
+  token_mask: torch.FloatTensor      # Mask
+  unweighted_loss: torch.FloatTensor # 用于记录的 Unweighted CE Scalar
 
 # class LightningModule(
 #     _DeviceDtypeModuleMixin,
@@ -193,70 +194,6 @@ class Diffusion(L.LightningModule):
                on_step=False,
                sync_dist=True)
 
-## CheckpointHooks
-  def on_load_checkpoint(self, checkpoint):
-    print('Loading checkpoint at', checkpoint['global_step'])
-    self._restarting_skip_val_flag = True
-
-    # for models compiled with `torch.compile`
-    if '_orig_mod.' in list(checkpoint['state_dict'].keys())[0]:
-      checkpoint = self._replace_ckpt_keys(checkpoint)
-
-    if self.ema:
-      self.ema.load_state_dict(checkpoint['ema'])
-    if 'sampling_eps_min' in checkpoint.keys():
-      self.sampling_eps_min = checkpoint['sampling_eps_min']
-      self.sampling_eps_max = checkpoint['sampling_eps_max']
-    # Copied from:
-    # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/datamodules/language_modeling_hf.py#L41
-    self.fast_forward_epochs = checkpoint['loops'][
-      'fit_loop']['epoch_progress'][
-        'current']['completed']
-    self.fast_forward_batches = checkpoint['loops'][
-      'fit_loop']['epoch_loop.batch_progress'][
-        'current']['completed']
-
-  def on_save_checkpoint(self, checkpoint):
-    if self.ema:
-      checkpoint['ema'] = self.ema.state_dict()
-    if hasattr(self, 'sampling_eps_min'):
-      checkpoint['sampling_eps_min'] = self.sampling_eps_min
-      checkpoint['sampling_eps_max'] = self.sampling_eps_max
-    # Copied from:
-    # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/tasks/seq.py
-    # ['epoch_loop.batch_progress']['total']['completed'] is 1 iteration
-    # behind, so we're using the optimizer's progress.
-    checkpoint['loops']['fit_loop'][
-      'epoch_loop.batch_progress']['total'][
-        'completed'] = checkpoint['loops']['fit_loop'][
-          'epoch_loop.automatic_optimization.optim_progress'][
-            'optimizer']['step']['total'][
-              'completed'] * self.trainer.accumulate_grad_batches
-    checkpoint['loops']['fit_loop'][
-      'epoch_loop.batch_progress']['current'][
-        'completed'] = checkpoint['loops']['fit_loop'][
-          'epoch_loop.automatic_optimization.optim_progress'][
-            'optimizer']['step']['current'][
-              'completed'] * self.trainer.accumulate_grad_batches
-    # _batches_that_stepped tracks the number of global steps, not the number
-    # of local steps, so we don't multiply with self.trainer.accumulate_grad_batches here.
-    checkpoint['loops']['fit_loop'][
-      'epoch_loop.state_dict'][
-        '_batches_that_stepped'] = checkpoint['loops']['fit_loop'][
-          'epoch_loop.automatic_optimization.optim_progress'][
-            'optimizer']['step']['total']['completed']
-    if 'sampler' not in checkpoint.keys():
-      checkpoint['sampler'] = {}
-    if hasattr(self.trainer.train_dataloader.sampler,
-               'state_dict'):
-      sampler_state_dict = self.trainer.\
-        train_dataloader.sampler.state_dict()
-      checkpoint['sampler'][
-        'random_state'] = sampler_state_dict.get(
-          'random_state', None)
-    else:
-      checkpoint['sampler']['random_state'] = None
-
 ## LightningModule中定义
   def forward(self, x, sigma, sample_mode=False, store_kv=False):
     """Returns log score."""
@@ -276,11 +213,31 @@ class Diffusion(L.LightningModule):
     losses = self._loss(batch['input_ids'],
                         batch['attention_mask'])
     self.metrics.train_nlls.update(losses.nlls, losses.token_mask)
-    self.log(name='trainer/loss',
-             value=losses.loss.item(),
-             on_step=True,
-             on_epoch=False,
-             sync_dist=True)
+    
+    # 记录详细指标
+    # 1. Weighted CE (优化目标, NLL Estimate)
+    weighted_ce = losses.loss
+    # 2. Unweighted CE (单纯的预测难度)
+    unweighted_ce = losses.unweighted_loss
+    # 3. NLL (负对数似然，单位 nats)
+    nll = weighted_ce
+    # 4. BPP (Bits Per Pixel)
+    #    BPP = NLL (nats) / ln(2)
+    bpp = weighted_ce / 0.69314718056
+    
+    self.log_dict({
+        'train/loss': weighted_ce,
+        'train/unweighted_ce': unweighted_ce,
+        'train/nll': nll,
+        'train/bpp': bpp
+    }, on_step=True, on_epoch=False, sync_dist=True, prog_bar=True)
+    
+    # self.log(name='trainer/loss',
+    #          value=losses.loss.item(),
+    #          on_step=True,
+    #          on_epoch=False,
+    #          sync_dist=True)
+    
     return losses.loss
 
   def validation_step(self, batch, batch_idx):
@@ -296,7 +253,8 @@ class Diffusion(L.LightningModule):
           losses = Loss(
             nlls=losses_clip.nlls.clone(),
             token_mask=losses_clip.token_mask,
-            loss=losses_clip.loss.clone())
+            loss=losses_clip.loss.clone(),
+            unweighted_loss=losses_clip.unweighted_loss.clone())
         elif len(self.metrics.valid_vars[noise_clip_start]) < 100:
           # elbo from clipped schedule (biased estimate)
           losses_clip = self._loss(batch['input_ids'],
@@ -322,6 +280,16 @@ class Diffusion(L.LightningModule):
                           sampling_eps_min=1e-3,
                           sampling_eps_max=1)
     self.metrics.valid_nlls.update(losses.nlls, losses.token_mask)
+    
+    # 显式记录 Val 指标
+    weighted_ce = losses.loss
+    bpp = weighted_ce / 0.69314718056
+    
+    self.log_dict({
+        'val/weighted_ce': weighted_ce,
+        'val/bpp': bpp
+    }, on_step=False, on_epoch=True, sync_dist=True)
+    
     return losses.loss
 
   def configure_optimizers(self):
@@ -404,19 +372,24 @@ class Diffusion(L.LightningModule):
      attention_mask) = self._maybe_sub_sample(
        x0, attention_mask)
     # self.parameterization == 'subs':
-    loss = self._forward_pass_diffusion(
+    weighted_loss_map, unweighted_loss_map = self._forward_pass_diffusion(
       input_tokens,
       sampling_eps_min=sampling_eps_min,
       sampling_eps_max=sampling_eps_max,)
     
     if self.ignore_bos and not self.training:
       attention_mask[:, 0] = 0
-      
-    nlls = (loss * attention_mask)
+    
+    # 计算 Weighted Mean (NLL)
+    nlls = (weighted_loss_map * attention_mask)
     token_nll = nlls.sum() / attention_mask.sum()
+    # 计算 Unweighted Mean
+    unweighted_nlls_scalar = (unweighted_loss_map * attention_mask).sum() / attention_mask.sum()
+    
     return Loss(loss=token_nll,
                 nlls=nlls,
-                token_mask=attention_mask)
+                token_mask=attention_mask,
+                unweighted_loss=unweighted_nlls_scalar)
 
   def _maybe_sub_sample(self, x0, attention_mask):
     seqlen = x0.shape[1]
@@ -467,8 +440,10 @@ class Diffusion(L.LightningModule):
       input=model_output,
       dim=-1,
       index=x0[:, :, None]).squeeze(-1)
-    loss = loss_scale * log_p_theta
-    return loss
+    weighted_loss = loss_scale * log_p_theta  # weighted cross entropy
+    unweighted_loss = -log_p_theta
+    
+    return weighted_loss, unweighted_loss
 
   def _sample_t(
       self, batch_dims, device, sampling_eps_min, sampling_eps_max, block_size=None):

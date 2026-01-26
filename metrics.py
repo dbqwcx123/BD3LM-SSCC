@@ -16,21 +16,11 @@ class NLL(torchmetrics.aggregation.MeanMetric):
 
 class BPD(NLL):
   def compute(self) -> Tensor:
-    """Computes the bits per dimension.
-
-    Returns:
-      bpd
+    """
+    Computes the bits per dimension.
     """
     return self.mean_value / self.weight / LOG2
 
-class Perplexity(NLL):
-  def compute(self) -> Tensor:
-    """Computes the Perplexity.
-
-    Returns:
-      Perplexity
-    """
-    return torch.exp(self.mean_value / self.weight)
 
 class NFEs(torchmetrics.aggregation.MeanMetric):
   pass
@@ -39,7 +29,7 @@ class Metrics:
   def __init__(self, config=None) -> None:
     self.config=config
     metrics = torchmetrics.MetricCollection({
-        'nll': NLL(), 'bpd': BPD(), 'ppl': Perplexity()})  # bpd: bits per dimension
+        'nll': NLL(), 'bpd': BPD()})
     if hasattr(config, 'block_size'):
       self.block_size = config.block_size
     else:
