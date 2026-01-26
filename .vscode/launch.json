@@ -37,7 +37,7 @@
       "name": "调试 compress",
       "type": "python",
       "request": "launch",
-      "program": "${workspaceFolder}/compress_optimized.py",
+      "program": "${workspaceFolder}/compress_bd3lm_optim.py",
       "console": "integratedTerminal",
       "justMyCode": false,
       "env": {
@@ -46,14 +46,17 @@
         "PYTHONPATH": "${workspaceFolder}"
       },
       "args": [
-        "algo.backbone=hf_dit",
+        "algo.backbone=dit",
         "algo.T=3",
+        "block_size=64",
+        "loader.eval_batch_size=1",
+        "sampling.checkpoint_path=/mnt/e/1Master1/0Science_Research/0DLM-SSCC/Model/bd3lm/bd3lm-owt-block_size64/best.ckpt",
         "sampling.first_hitting=False",
         "sampling.reset_channel_context=True",
         "model.length=1024",
-        "block_size=16",
-        "data.test_dataset=CIFAR10",
-        "data.num_images_test=10",
+        "data.test_dataset=DIV2K",
+        "data.image_size_test=256",
+        "data.num_images_test=1",
         "model.attn_backend=sdpa",
       ]
     },
