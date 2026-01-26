@@ -194,6 +194,70 @@ class Diffusion(L.LightningModule):
                on_step=False,
                sync_dist=True)
 
+## CheckpointHooks
+  def on_load_checkpoint(self, checkpoint):
+    print('Loading checkpoint at', checkpoint['global_step'])
+    self._restarting_skip_val_flag = True
+
+    # for models compiled with `torch.compile`
+    if '_orig_mod.' in list(checkpoint['state_dict'].keys())[0]:
+      checkpoint = self._replace_ckpt_keys(checkpoint)
+
+    if self.ema:
+      self.ema.load_state_dict(checkpoint['ema'])
+    if 'sampling_eps_min' in checkpoint.keys():
+      self.sampling_eps_min = checkpoint['sampling_eps_min']
+      self.sampling_eps_max = checkpoint['sampling_eps_max']
+    # Copied from:
+    # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/datamodules/language_modeling_hf.py#L41
+    self.fast_forward_epochs = checkpoint['loops'][
+      'fit_loop']['epoch_progress'][
+        'current']['completed']
+    self.fast_forward_batches = checkpoint['loops'][
+      'fit_loop']['epoch_loop.batch_progress'][
+        'current']['completed']
+
+  def on_save_checkpoint(self, checkpoint):
+    if self.ema:
+      checkpoint['ema'] = self.ema.state_dict()
+    if hasattr(self, 'sampling_eps_min'):
+      checkpoint['sampling_eps_min'] = self.sampling_eps_min
+      checkpoint['sampling_eps_max'] = self.sampling_eps_max
+    # Copied from:
+    # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/tasks/seq.py
+    # ['epoch_loop.batch_progress']['total']['completed'] is 1 iteration
+    # behind, so we're using the optimizer's progress.
+    checkpoint['loops']['fit_loop'][
+      'epoch_loop.batch_progress']['total'][
+        'completed'] = checkpoint['loops']['fit_loop'][
+          'epoch_loop.automatic_optimization.optim_progress'][
+            'optimizer']['step']['total'][
+              'completed'] * self.trainer.accumulate_grad_batches
+    checkpoint['loops']['fit_loop'][
+      'epoch_loop.batch_progress']['current'][
+        'completed'] = checkpoint['loops']['fit_loop'][
+          'epoch_loop.automatic_optimization.optim_progress'][
+            'optimizer']['step']['current'][
+              'completed'] * self.trainer.accumulate_grad_batches
+    # _batches_that_stepped tracks the number of global steps, not the number
+    # of local steps, so we don't multiply with self.trainer.accumulate_grad_batches here.
+    checkpoint['loops']['fit_loop'][
+      'epoch_loop.state_dict'][
+        '_batches_that_stepped'] = checkpoint['loops']['fit_loop'][
+          'epoch_loop.automatic_optimization.optim_progress'][
+            'optimizer']['step']['total']['completed']
+    if 'sampler' not in checkpoint.keys():
+      checkpoint['sampler'] = {}
+    if hasattr(self.trainer.train_dataloader.sampler,
+               'state_dict'):
+      sampler_state_dict = self.trainer.\
+        train_dataloader.sampler.state_dict()
+      checkpoint['sampler'][
+        'random_state'] = sampler_state_dict.get(
+          'random_state', None)
+    else:
+      checkpoint['sampler']['random_state'] = None
+
 ## LightningModule中定义
   def forward(self, x, sigma, sample_mode=False, store_kv=False):
     """Returns log score."""

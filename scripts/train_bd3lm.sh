@@ -10,7 +10,7 @@ python train_bd3lm.py \
     algo.clip_search_widths=[0.5,0.6,0.7,0.8,0.9] \
     model.length=1024 \
     block_size=64 \
-    wandb.name=bd3lm-owt-block_size64 \
+    wandb.name=bd3lm-div2k-block_size64-260126 \
     mode=train \
     model.attn_backend=flex \
     training.resample=True \
