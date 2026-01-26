@@ -15,6 +15,7 @@ from code_utils import arithmetic_coder
 from code_utils.ac_utils import normalize_pdf_for_arithmetic_coding
 from code_utils.pixel_token_dict import compute_pixel_token_ids, tokenid_to_pixel
 import utils
+from models.hf import BD3LM, BD3LMConfig
 
 # --- Hydra Resolvers ---
 OmegaConf.register_new_resolver('cwd', os.getcwd)
@@ -259,7 +260,7 @@ def run_decompression_pipeline(model, tokenizer, config, device):
     pixel_token_ids_tensor = torch.tensor(compute_pixel_token_ids(tokenizer), device=device)
     
     # 配置参数
-    batch_size = config.sampling.batch_size
+    batch_size = config.loader.eval_batch_size
     num_images = config.data.num_images_test
     img_size = config.data.image_size_test
     patch_size = config.data.patch_size
@@ -357,6 +358,48 @@ def run_decompression_pipeline(model, tokenizer, config, device):
     print("="*30)
 
 
+def _load_from_checkpoint(config, tokenizer, device):
+    if 'hf' in config.algo.backbone:
+        return diffusion_inf.Diffusion(config, tokenizer=tokenizer).to(device)
+    
+    # 实例化最外层的 Diffusion 类
+    # 此时 model.backbone 是一个原始的 DIT (由 Diffusion.__init__ 创建)
+    model = diffusion_inf.Diffusion(config, tokenizer=tokenizer)
+    
+    # 构造中间层 BD3LM，并进行替换
+    # push_to_hf 的逻辑
+    bd3lm_config = BD3LMConfig(
+        block_size=config.block_size,
+        vocab_size=tokenizer.vocab_size+1,
+        model_length=config.model.length,
+        attn_backend=config.model.attn_backend,
+        hidden_dim=768,
+        cond_dim=128,
+        n_blocks=12,
+        n_heads=12,
+        dropout=0.1,
+        time_conditioning=False,
+        return_dict=False
+    )
+    bd3lm_backbone = BD3LM(bd3lm_config)
+    
+    # 将 Diffusion 的 backbone 替换为 BD3LM
+    # Diffusion(model) -> BD3LM(model.backbone) -> DIT(model.backbone.backbone)
+    model.backbone = bd3lm_backbone
+    
+    ckpt = torch.load(config.sampling.checkpoint_path, map_location='cpu', weights_only=False)
+    state_dict = ckpt['state_dict']
+    
+    model = model.to(device)
+    model.load_state_dict(state_dict, strict=False)
+    ema_params = ckpt['ema']['shadow_params']
+    for s_param, param in zip(ema_params, model.parameters()):
+        if param.requires_grad:
+            param.data.copy_(s_param.data)
+
+    return model
+
+
 @hydra.main(version_base=None, config_path='configs', config_name='config_inf')
 def main(config):
     L.seed_everything(config.seed)
@@ -364,7 +407,7 @@ def main(config):
     tokenizer = utils.get_tokenizer(config)
     
     print(f"Loading model from {config.sampling.checkpoint_path}...")
-    model = diffusion_inf.Diffusion(config=config, tokenizer=tokenizer)
+    model = _load_from_checkpoint(config, tokenizer, device)
     model.to(device)
     model.backbone.eval()
     model.noise.eval()
