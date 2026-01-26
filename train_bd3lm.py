@@ -100,7 +100,8 @@ class Div2kPatchDataset(IterableDataset):
         ])
       else:
         self.transform = transforms.Compose([
-          transforms.Resize((32, 32)),
+          # transforms.Resize((32, 32)),
+          transforms.RandomCrop(size=(32, 32)),
     ])
       # ------------------------
       
@@ -269,7 +270,7 @@ def _train(config, logger, tokenizer):
   train_loader.tokenizer = tokenizer
   valid_loader.tokenizer = tokenizer
   
-  _print_batch(train_loader, valid_loader, tokenizer)
+  # _print_batch(train_loader, valid_loader, tokenizer)
 
   
   logger.info(f'Loading pretrained model from {config.training.from_pretrained}')
@@ -280,6 +281,8 @@ def _train(config, logger, tokenizer):
     config.training.sampling_eps_min))
   model.register_buffer('sampling_eps_max', torch.tensor(
     config.training.sampling_eps_max))
+  
+  # torch.set_float32_matmul_precision('high')
   
   trainer = hydra.utils.instantiate(
     config.trainer,

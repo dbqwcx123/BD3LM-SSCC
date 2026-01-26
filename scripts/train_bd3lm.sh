@@ -1,9 +1,9 @@
 python train_bd3lm.py \
     loader.data_dir=/mnt/e/1Master1/0Science_Research/0DLM-SSCC/Dataset/DIV2K/DIV2K_LR_unified/X4\
-    loader.global_batch_size=128 \
-    loader.eval_global_batch_size=128 \
-    loader.batch_size=4 \
-    loader.eval_batch_size=4 \
+    loader.global_batch_size=64 \
+    loader.eval_global_batch_size=64 \
+    loader.batch_size=2 \
+    loader.eval_batch_size=2 \
     model=small \
     algo=bd3lm \
     algo.backbone=hf_dit \

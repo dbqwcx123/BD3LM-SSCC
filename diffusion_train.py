@@ -139,8 +139,8 @@ class Diffusion(L.LightningModule):
       self.log(name=k,  value=v.compute(), on_step=False,
               on_epoch=True, sync_dist=True)
     self.ema.restore(self._get_parameters())
-    print(f"trainer.sanity_checking={self.trainer.sanity_checking}")
     if not self.trainer.sanity_checking:
+      print("\nSearching clipped schedule...\n")
       self._clipped_schedule_search()
       self.log('sampling_eps_min',
                self.sampling_eps_min,
@@ -199,8 +199,6 @@ class Diffusion(L.LightningModule):
     
     self.log_dict({
         'train/loss': weighted_ce,
-        'train/unweighted_ce': unweighted_ce,
-        'train/nll': nll,
         'train/bpp': bpp
     }, on_step=True, on_epoch=False, sync_dist=True, prog_bar=True)
     
@@ -245,7 +243,7 @@ class Diffusion(L.LightningModule):
     bpp = weighted_ce / 0.69314718056
     
     self.log_dict({
-        'val/weighted_ce': weighted_ce,
+        'val/loss': weighted_ce,
         'val/bpp': bpp
     }, on_step=False, on_epoch=True, sync_dist=True)
     
@@ -311,8 +309,7 @@ class Diffusion(L.LightningModule):
   
   def _check_val_sampling_intvl(self, sampling_eps_min, sampling_eps_max):
     """Checks if the current sampling interval is valid for reporting likelihood."""
-    if (sampling_eps_min == 1e-3 \
-        and sampling_eps_max == 1) :
+    if (sampling_eps_min == 1e-3 and sampling_eps_max == 1) :
       return True # elbo
     return False # not a valid elbo (biased estimate)
 
