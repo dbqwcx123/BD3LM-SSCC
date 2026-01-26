@@ -44,27 +44,15 @@ class Diffusion(L.LightningModule):
     self.save_hyperparameters()
     self.config = config
     self.tokenizer = tokenizer
-    self.vocab_size = self.tokenizer.vocab_size
-    self.sampler = self.config.algo.sampler
-    self.antithetic_sampling = self.config.training.antithetic_sampling
-    self.cross_attn = self.config.algo.cross_attn
-    self.ignore_bos = self.config.algo.ignore_bos
-    if (not hasattr(self.tokenizer, 'mask_token')
-        or self.tokenizer.mask_token is None):
-      self.mask_index = self.vocab_size
-      self.vocab_size += 1
-    else:
-      self.mask_index = self.tokenizer.mask_token_id
-    if hasattr(self.config, 'block_size'):
-      self.block_size = self.config.block_size
-    else:
-      self.block_size = self.config.model.length
+    self.mask_index = self.tokenizer.vocab_size
+    self.vocab_size = self.tokenizer.vocab_size + 1
+    self.block_size = self.config.block_size
     if self.config.algo.backbone == 'dit':
       self.backbone = models.dit.DIT(
         self.config, vocab_size=self.vocab_size)
     elif self.config.algo.backbone == 'hf_dit':
       self.backbone = transformers.AutoModelForMaskedLM.from_pretrained(
-        config.eval.checkpoint_path, trust_remote_code=True, local_files_only=True)
+        config.training.from_pretrained, trust_remote_code=True, local_files_only=True)
       # Regenerate mask if pretrained model uses flex attention mask
       # and current model uses sdpa mask
       if getattr(self.backbone.config, 'attn_backend', None) == 'flex' and \
@@ -82,24 +70,16 @@ class Diffusion(L.LightningModule):
     self.noise = noise_schedule.get_noise(self.config)
     self.metrics = metrics.Metrics(config)
 
-    if self.config.training.ema > 0:
-      self.ema = models.ema.ExponentialMovingAverage(
-        self._get_parameters(),
-        decay=self.config.training.ema)
-    else:
-      self.ema = None
+    self.ema = models.ema.ExponentialMovingAverage(
+      self._get_parameters(),
+      decay=self.config.training.ema)
     
-    self.var_min = self.config.algo.var_min
-    if self.var_min:
-      self.register_buffer('sampling_eps_min', torch.tensor(
-        self.config.training.sampling_eps_min))
-      self.register_buffer('sampling_eps_max', torch.tensor(
-        self.config.training.sampling_eps_max))
-      
-    self.time_conditioning = self.config.algo.time_conditioning
+    self.register_buffer('sampling_eps_min', torch.tensor(
+      self.config.training.sampling_eps_min))
+    self.register_buffer('sampling_eps_max', torch.tensor(
+      self.config.training.sampling_eps_max))
+    
     self.neg_infinity = -1000000.0
-    self.fast_forward_epochs = None
-    self.fast_forward_batches = None
 
 # __init__方法中用到的自定义函数
   def _get_parameters(self):
@@ -121,36 +101,16 @@ class Diffusion(L.LightningModule):
       self.sampling_eps_max = self.sampling_eps_max.to(*args, **kwargs)
     return self
 
-## ModelHooks
-  def on_validation_model_zero_grad(self) -> None:
-    '''
-    Small hack to avoid first validation on resume. 
-    This will NOT work if the gradient accumulation step should be performed at this point.
-    '''
-    super().on_validation_model_zero_grad()
-    if self.trainer.ckpt_path is not None and getattr(self, '_restarting_skip_val_flag', True):
-        self.trainer.sanity_checking = True
-        self._restarting_skip_val_flag = False
-
 ## LightningModule中定义
   def optimizer_step(self, *args, **kwargs):
     super().optimizer_step(*args, **kwargs)
-    if self.ema:
-      self.ema.update(self._get_parameters())
+    self.ema.update(self._get_parameters())
 
 
 # 覆盖父函数实现自己逻辑的函数
 ## ModelHooks
   def on_train_start(self):
-    if self.ema:
-      self.ema.move_shadow_params_to_device(self.device)
-    first_loader = self.trainer.fit_loop._combined_loader.flattened[0]
-    if isinstance(first_loader.dataset, torch.utils.data.IterableDataset):
-        print("Detected IterableDataset. Skipping FaultTolerantSampler injection.")
-        return
-    else:
-      print("No IterableDataset Detected.")
-      return -1
+    self.ema.move_shadow_params_to_device(self.device)
       
   def on_train_epoch_start(self):
     self.backbone.train()
@@ -161,13 +121,12 @@ class Diffusion(L.LightningModule):
 
   def on_validation_epoch_start(self):
     self.metrics.reset()
-    if self.ema:
-      self.ema.store(itertools.chain(
-        self.backbone.parameters(),
-        self.noise.parameters()))
-      self.ema.copy_to(itertools.chain(
-        self.backbone.parameters(),
-        self.noise.parameters()))
+    self.ema.store(itertools.chain(
+      self.backbone.parameters(),
+      self.noise.parameters()))
+    self.ema.copy_to(itertools.chain(
+      self.backbone.parameters(),
+      self.noise.parameters()))
     self.eval()
     self.backbone.eval()
     self.noise.eval()
@@ -179,9 +138,9 @@ class Diffusion(L.LightningModule):
     for k, v in self.metrics.valid_nlls.items():
       self.log(name=k,  value=v.compute(), on_step=False,
               on_epoch=True, sync_dist=True)
-    if self.ema:
-      self.ema.restore(self._get_parameters())
-    if self.var_min and not self.trainer.sanity_checking:
+    self.ema.restore(self._get_parameters())
+    print(f"trainer.sanity_checking={self.trainer.sanity_checking}")
+    if not self.trainer.sanity_checking:
       self._clipped_schedule_search()
       self.log('sampling_eps_min',
                self.sampling_eps_min,
@@ -197,66 +156,16 @@ class Diffusion(L.LightningModule):
 ## CheckpointHooks
   def on_load_checkpoint(self, checkpoint):
     print('Loading checkpoint at', checkpoint['global_step'])
-    self._restarting_skip_val_flag = True
-
-    # for models compiled with `torch.compile`
-    if '_orig_mod.' in list(checkpoint['state_dict'].keys())[0]:
-      checkpoint = self._replace_ckpt_keys(checkpoint)
-
-    if self.ema:
-      self.ema.load_state_dict(checkpoint['ema'])
+    self.ema.load_state_dict(checkpoint['ema'])
     if 'sampling_eps_min' in checkpoint.keys():
       self.sampling_eps_min = checkpoint['sampling_eps_min']
       self.sampling_eps_max = checkpoint['sampling_eps_max']
-    # Copied from:
-    # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/datamodules/language_modeling_hf.py#L41
-    self.fast_forward_epochs = checkpoint['loops'][
-      'fit_loop']['epoch_progress'][
-        'current']['completed']
-    self.fast_forward_batches = checkpoint['loops'][
-      'fit_loop']['epoch_loop.batch_progress'][
-        'current']['completed']
 
   def on_save_checkpoint(self, checkpoint):
-    if self.ema:
-      checkpoint['ema'] = self.ema.state_dict()
+    checkpoint['ema'] = self.ema.state_dict()
     if hasattr(self, 'sampling_eps_min'):
       checkpoint['sampling_eps_min'] = self.sampling_eps_min
       checkpoint['sampling_eps_max'] = self.sampling_eps_max
-    # Copied from:
-    # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/tasks/seq.py
-    # ['epoch_loop.batch_progress']['total']['completed'] is 1 iteration
-    # behind, so we're using the optimizer's progress.
-    checkpoint['loops']['fit_loop'][
-      'epoch_loop.batch_progress']['total'][
-        'completed'] = checkpoint['loops']['fit_loop'][
-          'epoch_loop.automatic_optimization.optim_progress'][
-            'optimizer']['step']['total'][
-              'completed'] * self.trainer.accumulate_grad_batches
-    checkpoint['loops']['fit_loop'][
-      'epoch_loop.batch_progress']['current'][
-        'completed'] = checkpoint['loops']['fit_loop'][
-          'epoch_loop.automatic_optimization.optim_progress'][
-            'optimizer']['step']['current'][
-              'completed'] * self.trainer.accumulate_grad_batches
-    # _batches_that_stepped tracks the number of global steps, not the number
-    # of local steps, so we don't multiply with self.trainer.accumulate_grad_batches here.
-    checkpoint['loops']['fit_loop'][
-      'epoch_loop.state_dict'][
-        '_batches_that_stepped'] = checkpoint['loops']['fit_loop'][
-          'epoch_loop.automatic_optimization.optim_progress'][
-            'optimizer']['step']['total']['completed']
-    if 'sampler' not in checkpoint.keys():
-      checkpoint['sampler'] = {}
-    if hasattr(self.trainer.train_dataloader.sampler,
-               'state_dict'):
-      sampler_state_dict = self.trainer.\
-        train_dataloader.sampler.state_dict()
-      checkpoint['sampler'][
-        'random_state'] = sampler_state_dict.get(
-          'random_state', None)
-    else:
-      checkpoint['sampler']['random_state'] = None
 
 ## LightningModule中定义
   def forward(self, x, sigma, sample_mode=False, store_kv=False):
@@ -265,10 +174,9 @@ class Diffusion(L.LightningModule):
     with torch.amp.autocast('cuda', dtype=torch.float32):
       logits = self.backbone(x, sigma, sample_mode, store_kv)  # [Modified]
 
-    if self.cross_attn:
-      x = x[:, :self.config.model.length]
-      logits = logits[:, :self.config.model.length, :]
-    # self.parameterization == 'subs':
+    x = x[:, :self.config.model.length]
+    logits = logits[:, :self.config.model.length, :]
+    
     return self._subs_parameterization(logits=logits, xt=x)
     # return logits
 
@@ -305,44 +213,31 @@ class Diffusion(L.LightningModule):
     return losses.loss
 
   def validation_step(self, batch, batch_idx):
-    if self.var_min:
-      for noise_clip_start in self.metrics.valid_vars.keys():
-        sampling_eps_min, sampling_eps_max = noise_clip_start
-        if self._check_val_sampling_intvl(sampling_eps_min, sampling_eps_max) == True:
-          # compute and record nelbo
-          losses_clip = self._loss(batch['input_ids'],
-                            batch['attention_mask'],
-                            sampling_eps_min=sampling_eps_min,
-                            sampling_eps_max=sampling_eps_max)
-          losses = Loss(
-            nlls=losses_clip.nlls.clone(),
-            token_mask=losses_clip.token_mask,
-            loss=losses_clip.loss.clone(),
-            unweighted_loss=losses_clip.unweighted_loss.clone())
-        elif len(self.metrics.valid_vars[noise_clip_start]) < 100:
-          # elbo from clipped schedule (biased estimate)
-          losses_clip = self._loss(batch['input_ids'],
-                            batch['attention_mask'],
-                            sampling_eps_min=sampling_eps_min,
-                            sampling_eps_max=sampling_eps_max)
-        if len(self.metrics.valid_vars[noise_clip_start]) < 100:
-          # only report variance over 100 batches
-          nlls = losses_clip.nlls
-          self.metrics.valid_vars[noise_clip_start].append(
-            nlls.reshape(
-              nlls.shape[0], -1, self.block_size).mean(-1))
-    elif self.block_size == 1:
-      # nll
-      losses = self._loss(batch['input_ids'],
+    for noise_clip_start in self.metrics.valid_vars.keys():
+      sampling_eps_min, sampling_eps_max = noise_clip_start
+      if self._check_val_sampling_intvl(sampling_eps_min, sampling_eps_max) == True:
+        # compute and record nelbo
+        losses_clip = self._loss(batch['input_ids'],
                           batch['attention_mask'],
-                          sampling_eps_min=1,
-                          sampling_eps_max=1)
-    else:
-      # nelbo
-      losses = self._loss(batch['input_ids'],
+                          sampling_eps_min=sampling_eps_min,
+                          sampling_eps_max=sampling_eps_max)
+        losses = Loss(
+          nlls=losses_clip.nlls.clone(),
+          token_mask=losses_clip.token_mask,
+          loss=losses_clip.loss.clone(),
+          unweighted_loss=losses_clip.unweighted_loss.clone())
+      elif len(self.metrics.valid_vars[noise_clip_start]) < 100:
+        # elbo from clipped schedule (biased estimate)
+        losses_clip = self._loss(batch['input_ids'],
                           batch['attention_mask'],
-                          sampling_eps_min=1e-3,
-                          sampling_eps_max=1)
+                          sampling_eps_min=sampling_eps_min,
+                          sampling_eps_max=sampling_eps_max)
+      if len(self.metrics.valid_vars[noise_clip_start]) < 100:
+        # only report variance over 100 batches
+        nlls = losses_clip.nlls
+        self.metrics.valid_vars[noise_clip_start].append(
+          nlls.reshape(
+            nlls.shape[0], -1, self.block_size).mean(-1))
     self.metrics.valid_nlls.update(losses.nlls, losses.token_mask)
     
     # 显式记录 Val 指标
@@ -410,19 +305,15 @@ class Diffusion(L.LightningModule):
     sigma = sigma.mean(-1).squeeze()
     if sigma.ndim == 0:
       sigma = sigma.unsqueeze(0)
-    if not self.time_conditioning:
-      sigma = torch.zeros_like(sigma)
+    sigma = torch.zeros_like(sigma)
     assert sigma.ndim == 1, sigma.shape
     return sigma
   
   def _check_val_sampling_intvl(self, sampling_eps_min, sampling_eps_max):
     """Checks if the current sampling interval is valid for reporting likelihood."""
     if (sampling_eps_min == 1e-3 \
-        and sampling_eps_max == 1 \
-        and not (self.block_size == 1 and self.config.training.eval_nll)):
+        and sampling_eps_max == 1) :
       return True # elbo
-    elif (self.block_size == 1 and sampling_eps_min >= 1):
-      return True # nll (block size 1)
     return False # not a valid elbo (biased estimate)
 
   def _loss(self, x0, attention_mask, t=None, sampling_eps_min=None, sampling_eps_max=None):
@@ -441,7 +332,7 @@ class Diffusion(L.LightningModule):
       sampling_eps_min=sampling_eps_min,
       sampling_eps_max=sampling_eps_max,)
     
-    if self.ignore_bos and not self.training:
+    if not self.training:
       attention_mask[:, 0] = 0
     
     # 计算 Weighted Mean (NLL)
@@ -490,12 +381,10 @@ class Diffusion(L.LightningModule):
                    sampling_eps_max=sampling_eps_max)
     if sampling_eps_min is not None and sampling_eps_min > 0.5:
       loss_scale = - torch.ones_like(loss_scale)
-    if self.ignore_bos:
-      xt[:, 0] = x0[:, 0]
+    xt[:, 0] = x0[:, 0]
     
     x_input = xt
-    if self.cross_attn:
-      x_input = torch.cat((xt, x0), dim=-1)
+    x_input = torch.cat((xt, x0), dim=-1)
 
     model_output = self.forward(x_input, sigma=sigma)
     utils.print_nans(model_output, 'model_output')
@@ -518,10 +407,9 @@ class Diffusion(L.LightningModule):
     _eps_b = torch.rand((batch_dims[0], num_blocks), device=device)
 
     # antithetic sampling along blocks & batches (for uniform sampling)
-    if self.antithetic_sampling:
-      offset_b = torch.arange(batch_dims[0] * num_blocks, device=device) / (batch_dims[0] * num_blocks)
-      offset_b = offset_b.view(batch_dims[0], num_blocks)
-      _eps_b = (_eps_b / (batch_dims[0] * num_blocks) + offset_b) % 1
+    offset_b = torch.arange(batch_dims[0] * num_blocks, device=device) / (batch_dims[0] * num_blocks)
+    offset_b = offset_b.view(batch_dims[0], num_blocks)
+    _eps_b = (_eps_b / (batch_dims[0] * num_blocks) + offset_b) % 1
     t = _eps_b
     if block_size != self.config.model.length:
       t = t.repeat_interleave(block_size, dim=-1)
@@ -553,9 +441,6 @@ class Diffusion(L.LightningModule):
     move_indices = torch.rand(
       * x.shape, device=x.device) <= p
     xt = torch.where(move_indices, self.mask_index, x)
-
-    if block_size == 1 and sampling_eps_min == 1.0:
-      return torch.full_like(x, self.mask_index)
 
     # no need to resample for bounds 1e-3, 1
     if self.config.training.resample and \
@@ -615,52 +500,10 @@ class Diffusion(L.LightningModule):
                 on_epoch=True,
                 on_step=False,
                 sync_dist=True)
-    if self.config.algo.fix_clipping == False:
-      self.sampling_eps_min.fill_(sampling_eps_min_best)
-      self.sampling_eps_max.fill_(sampling_eps_max_best)
+    self.sampling_eps_min.fill_(sampling_eps_min_best)
+    self.sampling_eps_max.fill_(sampling_eps_max_best)
   
   def _compute_entropy(self, x):
     _, counts = torch.unique(x, return_counts=True, sorted=False)
     entropy = torch.special.entr(counts.float() / counts.sum()).sum()
     return entropy
-  
-  def _check_stop_conds(self, x):
-    """Check if sampling should stop based on 1) eos, 2) entropy, or 3) likelihood.
-    Entropy/likelihood evaluated on last 256 token-block.
-    
-    Args:
-      x: torch.Tensor, current sample.
-    Returns:
-      stop: bool, whether to stop sampling.
-      x: torch.Tensor, sample (potentially truncated for variable-length sampling).
-    """
-    stop = False # stop sampling?
-    truncate_idx = None # truncate sample? (variable-length sampling only)
-
-    # CRITERION 2: always stop sampling if entropy is low
-    entropy = self._compute_entropy(x[:, -256:])
-    if entropy < 4:
-      stop = True
-
-    # for variable length sampling, check if we should stop
-    # sampling, and where to truncate the sample
-    if self.config.sampling.var_length:
-      # CRITERION 1: stop at sampled EOS token
-      if len(torch.where(x == self.tokenizer.eos_token_id)[0]) > 1:
-        stop = True
-        eos_idx = torch.where(x == self.tokenizer.eos_token_id)
-        if len(eos_idx[0]) > 1:
-          truncate_idx = min(eos_idx[1][1]+1, x.shape[1])
-
-      # CRITERION 2: stop if entropy/likelihood is low
-      if entropy < 4:
-        stop = True
-        truncate_idx = x.shape[1] - 256
-
-    # truncate sample (variable-length sampling only)
-    if truncate_idx is not None:
-      x = x[:, :truncate_idx]
-      if x.ndim == 1:
-        x = x.unsqueeze(0)
-
-    return stop, x

@@ -14,4 +14,4 @@ python train_bd3lm.py \
     mode=train \
     model.attn_backend=flex \
     training.resample=True \
-    eval.checkpoint_path=/mnt/e/1Master1/0Science_Research/0DLM-SSCC/Model/bd3lm/bd3lm-owt-block_size1024-pretrain \
+    training.from_pretrained=/mnt/e/1Master1/0Science_Research/0DLM-SSCC/Model/bd3lm/bd3lm-owt-block_size1024-pretrain \
