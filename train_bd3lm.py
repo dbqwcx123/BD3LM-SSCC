@@ -6,19 +6,10 @@ import omegaconf
 import rich.syntax
 import rich.tree
 import torch
-import transformers
-from torch.utils.data import IterableDataset, get_worker_info
-import torch.distributed as dist
-import math
-from natsort import natsorted
-import random
-import imageio
-from torchvision import transforms
-from PIL import Image
-import numpy as np
 
 import diffusion_train
 import utils
+from data_loaders import Div2kPatchDataset
 
 omegaconf.OmegaConf.register_new_resolver(
   'cwd', os.getcwd)
@@ -80,129 +71,6 @@ def _print_batch(train_ds, valid_ds, tokenizer, k=8):
     print('ids:', last)
 
 
-class Div2kPatchDataset(IterableDataset):
-    def __init__(self, data_path, tokenizer, samples_per_image=50, is_channel_wised=False, shuffle=True, split='train'):
-      super().__init__()
-      self.data_path = data_path
-      self.tokenizer = tokenizer
-      self.samples_per_image = samples_per_image
-      self.is_channel_wised = is_channel_wised
-      self.shuffle = shuffle
-      self.split = split
-      
-      # --- 训练集启用数据增广 ---
-      if split == 'train':
-        self.transform = transforms.Compose([
-          # 改为 RandomCrop，保留原始分辨率特征，也符合 Block 处理逻辑
-          transforms.RandomCrop(size=(32, 32)),
-          transforms.RandomHorizontalFlip(p=0.5),
-          transforms.RandomVerticalFlip(p=0.5),
-        ])
-      else:
-        self.transform = transforms.Compose([
-          # transforms.Resize((32, 32)),
-          transforms.RandomCrop(size=(32, 32)),
-    ])
-      # ------------------------
-      
-      # 1. 预先加载所有文件路径 (移出 __iter__ 以便切分)
-      if not os.path.exists(data_path):
-        raise ValueError(f"Data path {data_path} does not exist.")
-      
-      self.all_files = [
-        os.path.join(data_path, item) 
-        for item in os.listdir(data_path) 
-        if item.lower().endswith('.png')
-      ]
-      self.all_files = natsorted(self.all_files)
-      if shuffle:
-        random.seed(42) 
-        random.shuffle(self.all_files)
-      print(f"Dataset initialized: Found {len(self.all_files)} images.")
-
-    def process_patch_to_tokens(self, patch):
-      flat_pixels = patch.flatten() 
-      num_str_tokens = [str(val) for val in flat_pixels]
-      input_ids = self.tokenizer.convert_tokens_to_ids(num_str_tokens)
-      return torch.tensor(input_ids, dtype=torch.long)
-
-    def _get_image_iterator(self, files):
-      """内部生成器：处理指定的文件列表"""
-      for file_path in files:
-        image_np = imageio.v2.imread(file_path)
-        # --- 决定这张图产出多少个样本 ---
-        # 训练集：由 samples_per_image 决定
-        # 验证集：每张图只产出 1 个样本（就是它自己）
-        num_samples = self.samples_per_image if self.split == 'train' else 1
-        
-        for _ in range(num_samples):
-          image_pil = Image.fromarray(image_np)
-          image_pil = self.transform(image_pil)
-          patch = np.array(image_pil)
-          
-          # 按通道拆分
-          patches_to_yield = []
-          if self.is_channel_wised:
-            for i in range(patch.shape[-1]):
-              patches_to_yield.append(patch[:, :, i:i+1]) # (32, 32, 1)
-          else:
-            patches_to_yield.append(patch)
-
-          # Yield 数据
-          for p in patches_to_yield:
-            input_ids = self.process_patch_to_tokens(p)
-            attention_mask = torch.ones_like(input_ids, dtype=torch.long)
-            yield {
-              "input_ids": input_ids,
-              "attention_mask": attention_mask
-            }
-
-    def __iter__(self):
-      # --- 处理多卡 DDP 环境下的数据切分 ---
-      if dist.is_initialized():
-        num_gpus = dist.get_world_size()
-        gpu_id = dist.get_rank()
-      else:
-        num_gpus = 1
-        gpu_id = 0
-
-      # 把总文件列表按 GPU 数量均分
-      per_gpu_files_count = int(math.ceil(len(self.all_files) / float(num_gpus)))
-      start_gpu = gpu_id * per_gpu_files_count
-      end_gpu = min(start_gpu + per_gpu_files_count, len(self.all_files))
-      files_on_this_gpu = self.all_files[start_gpu:end_gpu]
-      
-      # --- 处理单卡内的多 Worker 切分 ---
-      worker_info = get_worker_info()
-      
-      if worker_info is None:
-        files_to_process = files_on_this_gpu
-      else:
-        # 多进程模式：基于当前 GPU 分到的文件，再分给每个 worker
-        per_worker = int(math.ceil(len(files_on_this_gpu) / float(worker_info.num_workers)))
-        worker_id = worker_info.id
-        start = worker_id * per_worker
-        end = min(start + per_worker, len(files_on_this_gpu))
-        files_to_process = files_on_this_gpu[start:end]
-      
-      return self._get_image_iterator(files_to_process)
-
-    def __len__(self):
-      """
-      计算总样本数，用于 tqdm 进度条显示。
-      """
-      num_files = len(self.all_files)
-      
-      if self.split == 'train':
-        multiplier = self.samples_per_image
-      else:
-        multiplier = 1 # 验证集每张图只测一次
-          
-      # 如果是按通道拆分，数量还要 * 3
-      if self.is_channel_wised:
-        multiplier *= 3
-          
-      return num_files * multiplier
 
 def _train(config, logger, tokenizer):
   logger.info('Starting Training.')
