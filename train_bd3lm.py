@@ -55,7 +55,6 @@ def _print_config(
         config.checkpointing.save_dir), 'w') as fp:
       rich.print(tree, file=fp)
 
-
 @L.pytorch.utilities.rank_zero_only
 def _print_batch(train_ds, valid_ds, tokenizer, k=8):
   for dl_type, dl in [
@@ -69,7 +68,6 @@ def _print_batch(train_ds, valid_ds, tokenizer, k=8):
     print('ids:', first)
     print(f'Last {k} tokens:', tokenizer.decode(last))
     print('ids:', last)
-
 
 
 def _train(config, logger, tokenizer):
@@ -108,12 +106,12 @@ def _train(config, logger, tokenizer):
   )
 
   valid_set = Div2kPatchDataset(
-    data_path=os.path.join(config.loader.data_dir, "test"),
+    data_path=os.path.join(config.loader.data_dir, "valid"),
     tokenizer=tokenizer,
     samples_per_image=1,
     is_channel_wised=config.data.is_channel_wised,
     shuffle=False,
-    split='test'
+    split='valid'
   )
   
   train_loader = torch.utils.data.DataLoader(
