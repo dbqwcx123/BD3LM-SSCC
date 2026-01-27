@@ -99,7 +99,7 @@ def _train(config, logger, tokenizer):
   train_set = Div2kPatchDataset(
     data_path=os.path.join(config.loader.data_dir, "train"),
     tokenizer=tokenizer,
-    samples_per_image=1,
+    samples_per_image=100,
     is_channel_wised=config.data.is_channel_wised,
     shuffle=True,
     split='train'

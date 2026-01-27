@@ -167,7 +167,7 @@ class Div2kPatchDataset(IterableDataset):
       else:
         self.transform = transforms.Compose([
           # transforms.Resize((32, 32)),
-          transforms.RandomCrop(size=(32, 32)),
+          transforms.CenterCrop(size=(32, 32)),
     ])
       # ------------------------
       

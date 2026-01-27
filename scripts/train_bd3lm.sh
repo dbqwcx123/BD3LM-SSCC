@@ -1,7 +1,7 @@
 python train_bd3lm.py \
     loader.data_dir=/data_133/rtq/Dataset/DIV2K/DIV2K_LR_unified/X4\
-    loader.global_batch_size=128 \
-    loader.eval_global_batch_size=128 \
+    loader.global_batch_size=256 \
+    loader.eval_global_batch_size=256 \
     loader.batch_size=4 \
     loader.eval_batch_size=4 \
     model=small \

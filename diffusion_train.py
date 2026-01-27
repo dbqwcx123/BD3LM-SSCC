@@ -156,15 +156,15 @@ class Diffusion(L.LightningModule):
               on_epoch=True, sync_dist=True)
     self.ema.restore(self._get_parameters())
     if not self.trainer.sanity_checking:
-      print("\nSearching clipped schedule...\n")
+      print("\nSearching clipped schedule...")
       self._clipped_schedule_search()
       
       current_min = self.sampling_eps_min.item()
       current_max = self.sampling_eps_max.item()
-      self.print(f"\n{'='*40}")
+      self.print(f"{'='*40}")
       self.print(f"[Auto-Schedule] Epoch {self.current_epoch} Update:")
       self.print(f"  New Sampling Interval: [{current_min:.4f}, {current_max:.4f}]")
-      self.print(f"{'='*40}\n")
+      self.print(f"{'='*40}")
       
       self.log('sampling_eps_min',
                self.sampling_eps_min,
@@ -412,7 +412,9 @@ class Diffusion(L.LightningModule):
                    sampling_eps_max=sampling_eps_max)
     if sampling_eps_min is not None and sampling_eps_min > 0.5:
       loss_scale = - torch.ones_like(loss_scale)
-    xt[:, 0] = x0[:, 0]
+      
+    # 从全 MASK 序列开始预测，无需 bos
+    # xt[:, 0] = x0[:, 0]  # 保留起始 token 不被加噪
     
     x_input = xt
     x_input = torch.cat((xt, x0), dim=-1)
