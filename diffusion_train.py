@@ -529,25 +529,73 @@ class Diffusion(L.LightningModule):
       xt = xt.reshape(xt.shape[0], -1, block_size)
       perc_masked = (xt == self.mask_index).float().sum(-1) / block_size
     return xt
-  
+
+  # def _clipped_schedule_search(self):
+  #   # collect losses per batch across devices and sum them per interval
+  #   best_var = float('inf')
+  #   for (eps_min, eps_max), var in self.metrics.valid_vars.items():
+  #     all_vars = torch.tensor(0., device=self.device)
+  #     for i in range(len(var)):
+  #       agg_var = var[i].to(self.device)
+  #       agg_var = self.all_gather(agg_var)
+  #       all_vars += agg_var.var()
+  #     if all_vars < best_var:
+  #       best_var = all_vars
+  #       sampling_eps_min_best = eps_min
+  #       sampling_eps_max_best = eps_max
+  #     self.log(f'valid_var_{round(eps_min, 2)} - {round(eps_max, 2)}',
+  #               all_vars / len(var),
+  #               on_epoch=True,
+  #               on_step=False,
+  #               sync_dist=True)
+  #   self.sampling_eps_min.fill_(sampling_eps_min_best)
+  #   self.sampling_eps_max.fill_(sampling_eps_max_best)
+
   def _clipped_schedule_search(self):
     # collect losses per batch across devices and sum them per interval
     best_var = float('inf')
-    for (eps_min, eps_max), var in self.metrics.valid_vars.items():
-      all_vars = torch.tensor(0., device=self.device)
-      for i in range(len(var)):
-        agg_var = var[i].to(self.device)
-        agg_var = self.all_gather(agg_var)
-        all_vars += agg_var.var()
-      if all_vars < best_var:
-        best_var = all_vars
-        sampling_eps_min_best = eps_min
-        sampling_eps_max_best = eps_max
-      self.log(f'valid_var_{round(eps_min, 2)} - {round(eps_max, 2)}',
-                all_vars / len(var),
-                on_epoch=True,
-                on_step=False,
-                sync_dist=True)
+    
+    sampling_eps_min_best = self.sampling_eps_min.item()
+    sampling_eps_max_best = self.sampling_eps_max.item()
+
+    for (eps_min, eps_max), var_list in self.metrics.valid_vars.items():
+        # var_list 是一个 list，长度为 batch_num，里面是 Tensor
+        # 1. 【本地合并】：先将 list 转为 Tensor [Batch_Size]
+        local_vars = torch.cat(var_list, dim=0).to(self.device)
+        
+        # 2. 【一次通信】：一次性把所有 GPU 的所有 Batch 数据拿过来
+        global_vars = self.all_gather(local_vars) 
+        
+        # 3. 【集中计算】：在拿到所有数据后，一次性计算方差
+        # 计算总方差，对应原逻辑：对每个 Batch (跨 GPU 收集后) 算方差，然后求和
+        # [World_Size, Num_Batches, Batch_items] -> permute -> [Num_Batches, World_Size, Batch_items]
+        # -> flatten(1) -> [Num_Batches, Total_Items_In_Batch]
+        if global_vars.dim() == 3:
+             # 假设 local_vars 是 [Num_Batches, Items]
+             combined = global_vars.permute(1, 0, 2).reshape(len(var_list), -1)
+             current_total_var = combined.var(dim=1).sum()
+        else:
+             # 无法确定维度，还是在本地循环计算
+             current_total_var = 0.0
+             # global_vars: [World_Size, Num_Batches, ...]
+             # 按 Batch 维度切分
+             num_batches = local_vars.shape[0]
+             for i in range(num_batches):
+                 # 取出第 i 个 batch 在所有 GPU 上的数据
+                 batch_data = global_vars[:, i, ...] 
+                 current_total_var += batch_data.var()
+
+        if current_total_var < best_var:
+            best_var = current_total_var
+            sampling_eps_min_best = eps_min
+            sampling_eps_max_best = eps_max
+            
+        self.log(f'valid_var_{round(eps_min, 2)} - {round(eps_max, 2)}',
+                 current_total_var / len(var_list), # 原逻辑是除以 batch 数
+                 on_epoch=True,
+                 on_step=False,
+                 sync_dist=True)
+
     self.sampling_eps_min.fill_(sampling_eps_min_best)
     self.sampling_eps_max.fill_(sampling_eps_max_best)
   

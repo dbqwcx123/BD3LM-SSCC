@@ -120,7 +120,8 @@ def _train(config, logger, tokenizer):
     num_workers=config.loader.num_workers,
     pin_memory=config.loader.pin_memory,
     shuffle=False,  # 必须为 False，乱序已在 Dataset 内部通过 shuffle=True 处理
-    persistent_workers=True if config.loader.num_workers > 0 else False
+    persistent_workers=True if config.loader.num_workers > 0 else False,
+    drop_last=True
   )
 
   valid_loader = torch.utils.data.DataLoader(
@@ -129,7 +130,8 @@ def _train(config, logger, tokenizer):
     num_workers=config.loader.num_workers,
     pin_memory=config.loader.pin_memory,
     shuffle=False, 
-    persistent_workers=True if config.loader.num_workers > 0 else False
+    persistent_workers=True if config.loader.num_workers > 0 else False,
+    drop_last=True
   )
 
   # 补充原 dataloader 的特殊属性
