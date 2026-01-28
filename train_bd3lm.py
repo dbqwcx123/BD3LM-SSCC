@@ -119,7 +119,7 @@ def _train(config, logger, tokenizer):
     batch_size=config.loader.batch_size,
     num_workers=config.loader.num_workers,
     pin_memory=config.loader.pin_memory,
-    shuffle=False,  # 必须为 False，乱序已在 Dataset 内部通过 shuffle=True 处理
+    shuffle=True,
     persistent_workers=True if config.loader.num_workers > 0 else False,
     drop_last=True
   )

@@ -1,10 +1,10 @@
-block_size=64
+block_size=256
 python compress_bd3lm_optim.py \
     algo.backbone=dit \
-    algo.T=5 \
+    algo.T=10 \
     block_size=${block_size} \
     loader.eval_batch_size=10 \
-    sampling.checkpoint_path=/mnt/e/1Master1/0Science_Research/0DLM-SSCC/BD3LM-SSCC/outputs/train/2026.01.27/010654/checkpoints/best.ckpt \
+    sampling.checkpoint_path=/data_133/rtq/BD3LM-SSCC/outputs/train/2026.01.28/173432/checkpoints/best.ckpt \
     sampling.first_hitting=False \
     sampling.reset_channel_context=True \
     model.length=1024 \
