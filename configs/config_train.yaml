@@ -4,7 +4,7 @@ defaults:
   - /model: small
   - /strategy: ddp
   - /noise: loglinear
-  - /lr_scheduler: constant_warmup
+  - /lr_scheduler: cosine_decay_warmup
   - /algo: bd3lm
 
 mode: train  # train / sample_eval
@@ -21,7 +21,7 @@ loader:
   # Note: batch_size and eval_batch_size are **per machine**
   batch_size: ${div_up:${.global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
   eval_batch_size: ${div_up:${.eval_global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
-  num_workers: 4
+  num_workers: 0
   pin_memory: True
 
 data:
@@ -41,7 +41,7 @@ optim:
   beta1: 0.9
   beta2: 0.999
   eps: 1e-8
-  weight_decay: 0
+  weight_decay: 1e-2
 
 trainer:
   _target_: lightning.Trainer
@@ -52,11 +52,11 @@ trainer:
   gradient_clip_val: 1.0
   precision: 'bf16-mixed'
   num_sanity_val_steps: 2
-  max_steps: 1_000_000
+  max_steps: 20720           # ~20 epochs
   log_every_n_steps: 1
   limit_train_batches: 1.0   # train on full dataset, can be used to toggle quick run
   limit_val_batches: 1.0     # validate on full dataset, can be used to toggle quick run
-  val_check_interval: 2000   # validate every N training steps
+  val_check_interval: 6630   # validate every N training steps
 
 wandb:
   project: BD3-LMs
@@ -78,5 +78,5 @@ checkpointing:
   # Use custom `save_dir` if, e.g., saving to S3 bucket, otherwise leave this parameter as is
   save_dir: ${cwd:}
   # Note: `checkpoints` path should correspond to `checkpoint_every_n_steps.dirpath`
-  resume_from_ckpt: False
-  resume_ckpt_path: ${.save_dir}/checkpoints/last.ckpt
+  resume_from_ckpt: True
+  resume_ckpt_path: /data_133/rtq/BD3LM-SSCC/outputs/train/2026.01.29/152740/checkpoints/last.ckpt
