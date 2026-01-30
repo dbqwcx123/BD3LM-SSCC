@@ -53,14 +53,49 @@ class Diffusion(L.LightningModule):
     elif self.config.algo.backbone == 'hf_dit':
       self.backbone = transformers.AutoModelForMaskedLM.from_pretrained(
         config.training.from_pretrained, trust_remote_code=True, local_files_only=True)
+      
+      # ================== 核心修复开始 ==================
+      # [说明] 无论预训练模型是什么配置，都强制使用当前 YAML 的参数覆盖它
+      # 避免 block_size 错位或 cross_attn 未开启导致的数据泄露
+      print(f"[Force Config] Overriding model config: block_size={self.config.block_size}, cross_attn=True")
+      # 1. 强制更新 Config 对象中的关键参数
+      self.backbone.config.model_length = self.config.model.length
+      self.backbone.config.block_size = self.config.block_size  # 关键：修正为 256
+      self.backbone.config.cross_attn = True                    # 关键：开启 Cross Attn
+      self.backbone.config.attn_backend = self.config.model.attn_backend
+      
+      # 2. 强制将配置同步到底层 Backbone 模块 (防止有模块没引用 config 对象)
+      if hasattr(self.backbone, "backbone"):
+        # 同步属性
+        self.backbone.backbone.block_size = self.config.block_size
+        self.backbone.backbone.cross_attn = True
+        self.backbone.backbone.attn_backend = self.config.model.attn_backend
+        
+        # 遍历所有 Block，确保 Attention 后端正确 (替代了原代码的 for 循环功能)
+        if hasattr(self.backbone.backbone, "blocks"):
+          for block in self.backbone.backbone.blocks:
+            block.attn_backend = self.config.model.attn_backend
+            block.block_size = self.config.block_size # 确保 Block 内部切分逻辑正确
+        
+        # 3. [最关键一步] 重新生成 Attention Mask
+        # 这会根据 cross_attn=True 和 block_size=256 生成正确的掩码
+        # 从而遮挡住 x0，防止泄露
+        print(f"[Mask Gen] Regenerating attention mask with block_size={self.config.block_size}...")
+        self.backbone.backbone.gen_mask(
+          seqlen=self.config.model.length, 
+          block_size=self.config.block_size, 
+          attn_backend=self.config.model.attn_backend
+        )
+      # ================== 核心修复结束 ==================
+      
       # Regenerate mask if pretrained model uses flex attention mask
       # and current model uses sdpa mask
-      if getattr(self.backbone.config, 'attn_backend', None) == 'flex' and \
-        self.config.model.attn_backend == 'sdpa':
-        self.backbone.config.attn_backend = 'sdpa'
-        for i in self.backbone.backbone.blocks:
-          i.attn_backend = 'sdpa'
-        self.backbone.backbone.gen_mask(self.config.model.length, self.block_size, attn_backend='sdpa')
+      # if getattr(self.backbone.config, 'attn_backend', None) == 'flex' and \
+      #   self.config.model.attn_backend == 'sdpa':
+      #   self.backbone.config.attn_backend = 'sdpa'
+      #   for i in self.backbone.backbone.blocks:
+      #     i.attn_backend = 'sdpa'
+      #   self.backbone.backbone.gen_mask(self.config.model.length, self.block_size, attn_backend='sdpa')
     else:
       raise ValueError(f'Unknown backbone: {self.config.algo.backbone}')
 
@@ -509,8 +544,17 @@ class Diffusion(L.LightningModule):
     """Resamples x_t if the percentage of masked tokens is outside the bounds
     defined by sampling_eps_min and sampling_eps_max."""
     perc_masked = (xt == self.mask_index).float().sum(-1) / block_size
+    
+    # [Fix] 增加计数器，防止死循环
+    cnt = 0 
+    max_iter = 50
+    
     while (perc_masked < sampling_eps_min).any() or \
       (perc_masked > sampling_eps_max).any():
+      # [Fix] 超过次数强制退出循环
+      if cnt > max_iter: break
+      cnt += 1
+      
       # if a bound is epsilon, don't resample
       if sampling_eps_min == 1e-3 and sampling_eps_max != 1:
         regen_idx = (perc_masked > sampling_eps_max)

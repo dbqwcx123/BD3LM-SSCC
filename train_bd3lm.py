@@ -85,6 +85,7 @@ def _train(config, logger, tokenizer):
     ckpt_path = config.checkpointing.resume_ckpt_path
     logger.info(f'Resuming training at {ckpt_path}')
   else:
+    logger.info(f'ckpt_path = None, training from scratch')
     ckpt_path = None
 
   # Lightning callbacks
