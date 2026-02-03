@@ -62,7 +62,8 @@ class FastPixelTokenizer:
         self.id_to_pixel = torch.zeros(tokenizer.vocab_size, dtype=torch.long, device=device)
         
         for i in range(256):
-            token_id = tokenizer.convert_tokens_to_ids(str(i))
+            text = str(i)
+            token_id = tokenizer.convert_tokens_to_ids(text)
             self.pixel_to_id[i] = token_id
             self.id_to_pixel[token_id] = i
 
@@ -345,7 +346,7 @@ def main(config):
     if config.data.test_dataset == "CIFAR10":
         test_dataset_path = os.path.join(config.data.dataset_root, "CIFAR10", "cifar10_test")
     elif config.data.test_dataset  == "DIV2K":
-        test_dataset_path  = os.path.join(config.data.dataset_root, "DIV2K", "DIV2K_LR_unified", "X4", "test")
+        test_dataset_path  = os.path.join(config.data.dataset_root, "DIV2K", "DIV2K_LR_unified", "X4", "test_1")
     elif config.data.test_dataset == "ImageNet":
         test_dataset_path  = os.path.join(config.data.dataset_root, "ImageNet", "test_unified")
     print(f"Dataset Path: {test_dataset_path}")

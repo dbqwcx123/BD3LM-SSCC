@@ -190,7 +190,7 @@ class Diffusion(L.LightningModule):
       self.log(name=k,  value=v.compute(), on_step=False,
               on_epoch=True, sync_dist=True)
     self.ema.restore(self._get_parameters())
-    if not self.trainer.sanity_checking:
+    if self.sampling_eps_max==1.0 and self.sampling_eps_min==1e-3 and not self.trainer.sanity_checking:
       print("\nSearching clipped schedule...")
       self._clipped_schedule_search()
       

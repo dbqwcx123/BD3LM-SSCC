@@ -33,11 +33,11 @@ training:
   ema: 0.9999
   sampling_eps: 1e-3
   sampling_eps_min: 1e-3
-  sampling_eps_max: 1.0
+  sampling_eps_max: 0.5
   resample: False
 
 optim:
-  lr: 1e-4
+  lr: 3e-4
   beta1: 0.9
   beta2: 0.999
   eps: 1e-8
@@ -78,5 +78,5 @@ checkpointing:
   # Use custom `save_dir` if, e.g., saving to S3 bucket, otherwise leave this parameter as is
   save_dir: ${cwd:}
   # Note: `checkpoints` path should correspond to `checkpoint_every_n_steps.dirpath`
-  resume_from_ckpt: True
+  resume_from_ckpt: False
   resume_ckpt_path: /data_133/rtq/BD3LM-SSCC/outputs/train/2026.01.29/152740/checkpoints/last.ckpt
