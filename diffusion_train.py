@@ -1,6 +1,6 @@
 import os
-# os.environ['TRANSFORMERS_OFFLINE'] = '1'
-# os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ['TRANSFORMERS_OFFLINE'] = '1'
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import itertools
 from dataclasses import dataclass
 
@@ -15,6 +15,7 @@ from collections import OrderedDict
 import numpy as np
 import itertools
 import math
+from torch.optim.lr_scheduler import LambdaLR
 
 import metrics
 import models
@@ -117,10 +118,14 @@ class Diffusion(L.LightningModule):
     self.neg_infinity = -1000000.0
     
     # 1. 预计算 Pixel Token IDs 和 Vocab Map
+    
     pixel_ids_list = []
     for i in range(256):
         # 将 '0'-'255' 字符串转为对应的 ID
-        pixel_ids_list.append(self.tokenizer.convert_tokens_to_ids(str(i)))
+        ids = tokenizer.encode(str(i), add_special_tokens=False)
+        assert len(ids) == 1, f"Error: Number {i} tokenizes to {ids}"
+        pixel_ids_list.append(ids[0])
+        # pixel_ids_list.append(self.tokenizer.convert_tokens_to_ids(str(i)))
     
     # 注册 buffer，会自动随模型移动到 GPU
     self.register_buffer('pixel_token_ids', torch.tensor(pixel_ids_list, dtype=torch.long))
@@ -131,6 +136,48 @@ class Diffusion(L.LightningModule):
         if pid < self.vocab_size:
             vocab_map_tensor[pid] = i
     self.register_buffer('vocab_map', vocab_map_tensor)
+    
+    # ================== 改进方案 1: Embedding 重构 ==================
+    # 目的：让 token "128" 和 "129" 的向量由于数学特性天然相似
+    # 获取模型原本的 embedding 层引用 (根据 modeling_bd3lm.py 结构)
+    # BD3LM -> DITBackbone -> EmbeddingLayer -> nn.Parameter
+    embedding_layer = self.backbone.backbone.vocab_embed.embedding 
+    hidden_dim = embedding_layer.shape[1]
+
+    # 创建正弦编码 (Sinusoidal Position Encoding 风格)，[256, hidden_dim]
+    position = torch.arange(256).unsqueeze(1).float()
+    div_term = torch.exp(torch.arange(0, hidden_dim, 2).float() * -(math.log(10000.0) / hidden_dim))
+    sinusoidal_embed = torch.zeros(256, hidden_dim)
+    sinusoidal_embed[:, 0::2] = torch.sin(position * div_term)
+    sinusoidal_embed[:, 1::2] = torch.cos(position * div_term)
+
+    # 强制覆盖预训练模型中对应的 Token Embedding
+    # 注意：这会破坏该 Token 原本的文本语义，但对于纯像素压缩任务是正向的
+    with torch.no_grad():
+        ids = self.pixel_token_ids.to(embedding_layer.device) 
+        sinusoidal_embed = sinusoidal_embed.to(embedding_layer.device)
+        
+        # 1. 覆盖 Input Embedding
+        embedding_layer[ids] = sinusoidal_embed
+        
+        # 2. 同步 Output Layer 权重
+        output_weight = self.backbone.backbone.output_layer.linear.weight
+        # 检查是否已经是共享权重 (Weight Tying)
+        if embedding_layer.data_ptr() == output_weight.data_ptr():
+          print("[Info] Weights are tied. Output layer is already updated.")
+        else:
+          print("[Optimization] Syncing output layer weights with Sinusoidal embeddings...")
+          # 确保形状匹配 (通常都是 [50257, Hidden])
+          if output_weight.shape == embedding_layer.shape:
+            output_weight[ids] = embedding_layer[ids]
+          else:
+            # 防止形状转置的情况 (虽然在HF GPT2实现中很少见，但为了稳健)
+            output_weight[ids, :] = embedding_layer[ids, :]
+          print("[Optimization] Output layer synced.")
+
+    print("[Optimization] Re-initialized Pixel Embeddings & Output Weights with Sinusoidal structure.")
+    # =============================================================
+
 
 # __init__方法中用到的自定义函数
   def _get_parameters(self):
@@ -190,7 +237,7 @@ class Diffusion(L.LightningModule):
       self.log(name=k,  value=v.compute(), on_step=False,
               on_epoch=True, sync_dist=True)
     self.ema.restore(self._get_parameters())
-    if self.sampling_eps_max==1.0 and self.sampling_eps_min==1e-3 and not self.trainer.sanity_checking:
+    if not self.config.algo.fix_clipping and not self.trainer.sanity_checking:
       print("\nSearching clipped schedule...")
       self._clipped_schedule_search()
       
@@ -250,11 +297,7 @@ class Diffusion(L.LightningModule):
     # 记录详细指标
     # 1. Weighted CE (优化目标, NLL Estimate)
     weighted_ce = losses.loss
-    # 2. Unweighted CE (单纯的预测难度)
-    unweighted_ce = losses.unweighted_loss
-    # 3. NLL (负对数似然，单位 nats)
-    nll = weighted_ce
-    # 4. BPP (Bits Per Pixel)
+    # 2. BPP (Bits Per Pixel)
     #    BPP = NLL (nats) / ln(2)
     bpp = weighted_ce / 0.69314718056
     
@@ -311,25 +354,108 @@ class Diffusion(L.LightningModule):
     return losses.loss
 
   def configure_optimizers(self):
-    # TODO(yair): Lightning currently giving this warning when using `fp16`:
-    #  "Detected call of `lr_scheduler.step()` before `optimizer.step()`. "
-    #  Not clear if this is a problem or not.
-    #  See: https://github.com/Lightning-AI/pytorch-lightning/issues/5558
-    optimizer = torch.optim.AdamW(
-      self._get_parameters(),
-      lr=self.config.optim.lr,
-      betas=(self.config.optim.beta1,
-             self.config.optim.beta2),
-      eps=self.config.optim.eps,
-      weight_decay=self.config.optim.weight_decay)
+    # 1. ------------- 差分学习率策略 (Differential LR) -------------
+    # 将参数分为两组：Backbone (预训练部分) 和 New Layers (新初始化的Embedding/Head)
+    # 假设你的配置文件中有 self.config.optim.lr 作为基础学习率
+    base_lr = self.config.optim.lr
+    backbone_lr_ratio = 0.3  # Backbone 学习率是基础学习率的 0.3 倍
+    
+    backbone_params = []
+    new_params = []
+    
+    # 关键词匹配：根据实际打印出的 named_parameters 调整这里的关键词
+    modules = [name for name, _ in self.named_parameters()]
+    target_new_modules = ['vocab_embed.embedding', 'output_layer.linear']
+    
+    for name, param in self.named_parameters():
+      if not param.requires_grad:
+        continue
+      
+      # 检查参数名是否包含新层的关键词
+      is_new = any(k in name for k in target_new_modules)
+      
+      if is_new:
+        # print(f"  -> High LR (New): {name}")
+        new_params.append(param)
+      else:
+        backbone_params.append(param)
+    # print(f"[Optimizer] Summary: {len(new_params)} params in New Group (High LR), {len(backbone_params)} params in Backbone Group (Low LR).\n")
+    # 创建参数组
+    optimizer_groups = [
+      # 组1：Backbone，使用较小的学习率
+      {'params': backbone_params, 'lr': base_lr * backbone_lr_ratio},
+      # 组2：新层，使用全速学习率
+      {'params': new_params, 'lr': base_lr}
+    ]
 
-    scheduler = hydra.utils.instantiate(
-      self.config.lr_scheduler, optimizer=optimizer)
-    scheduler_dict = {'scheduler': scheduler,
-                      'interval': 'step',
-                      'monitor': 'val/loss',
-                      'name': 'trainer/lr'}
+    optimizer = torch.optim.AdamW(
+      optimizer_groups, # 传入参数组而非全部参数
+      betas=(self.config.optim.beta1, self.config.optim.beta2),
+      eps=self.config.optim.eps,
+      weight_decay=self.config.optim.weight_decay
+    )
+
+    # 2. ------------- 自定义调度器 (Warmup -> Constant -> Decay) -------------
+    # 我们放弃 hydra 的自动实例化，改用 LambdaLR 手写逻辑
+    # 假设总步数从 trainer 获取 (如果不方便获取，可以在 config 里硬编码 max_steps)
+    if self.trainer.max_steps and self.trainer.max_steps > 0:
+      total_steps = self.trainer.max_steps
+    else:
+      total_steps = self.config.training.max_steps # 备选方案，取决于你的config结构
+
+    # 定义阶段比例
+    warmup_ratio = 0.1  # 前 10% Warmup
+    constant_ratio = 0.3 # 接下来 30% 保持 Constant
+    # 剩余为 Decay
+    
+    warmup_steps = int(total_steps * warmup_ratio)
+    constant_end_step = int(total_steps * (warmup_ratio + constant_ratio))
+
+    def lr_lambda(current_step):
+      # 阶段 1: Warmup
+      if current_step < warmup_steps:
+        return float(current_step) / float(max(1, warmup_steps))
+      
+      # 阶段 2: Constant (保持 1.0 倍率)
+      elif current_step < constant_end_step:
+        return 1.0
+      
+      # 阶段 3: Decay (Cosine Decay 到 0)
+      else:
+        progress = float(current_step - constant_end_step) / float(max(1, total_steps - constant_end_step))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+    scheduler_dict = {
+        'scheduler': scheduler,
+        'interval': 'step',
+        'monitor': 'val/loss',
+        'name': 'trainer/lr'
+    }
+    
     return [optimizer], [scheduler_dict]
+
+  # def configure_optimizers(self):
+  #   # TODO(yair): Lightning currently giving this warning when using `fp16`:
+  #   #  "Detected call of `lr_scheduler.step()` before `optimizer.step()`. "
+  #   #  Not clear if this is a problem or not.
+  #   #  See: https://github.com/Lightning-AI/pytorch-lightning/issues/5558
+  #   optimizer = torch.optim.AdamW(
+  #     self._get_parameters(),
+  #     lr=self.config.optim.lr,
+  #     betas=(self.config.optim.beta1,
+  #            self.config.optim.beta2),
+  #     eps=self.config.optim.eps,
+  #     weight_decay=self.config.optim.weight_decay)
+
+  #   scheduler = hydra.utils.instantiate(
+  #     self.config.lr_scheduler, optimizer=optimizer)
+  #   scheduler_dict = {'scheduler': scheduler,
+  #                     'interval': 'step',
+  #                     'monitor': 'val/loss',
+  #                     'name': 'trainer/lr'}
+  #   return [optimizer], [scheduler_dict]
 
 # 自定义函数
   def _replace_ckpt_keys(self, checkpoint):
@@ -431,7 +557,29 @@ class Diffusion(L.LightningModule):
     
     return input_tokens, output_tokens, new_attention_mask
 
+  def _get_current_sigma(self):
+    # 初始 sigma (比较模糊，利于收敛)
+    start_sigma = 2.0
+    # 最终 sigma (比较锐利，利于细节)
+    end_sigma = 0.5
+    # 获取当前步数和总步数
+    step = self.trainer.global_step
+    
+    if hasattr(self, 'trainer') and self.trainer.max_steps > 0:
+        total_steps = self.trainer.max_steps
+    else:
+        total_steps = 60000 # 兜底默认值
+        
+    # 计算进度 (0.0 -> 1.0)
+    progress = min(1.0, step / total_steps)
+    
+    # 策略：线性衰减 (Linear Decay)
+    current_sigma = start_sigma - (start_sigma - end_sigma) * progress
+    
+    return current_sigma
+
   def _forward_pass_diffusion(self, x0, t=None, sampling_eps_min=None, sampling_eps_max=None):
+    # ================= 1. 采样噪声与时间步 =================
     if t is None:
       t = self._sample_t(x0.shape,
                          x0.device,
@@ -439,6 +587,14 @@ class Diffusion(L.LightningModule):
                          sampling_eps_max)
 
     loss_scale, p = self.noise(t)
+    
+    # # === [Debug] ===
+    # if self.global_step % 10 == 0:
+    #     print(f"\n[Debug] Step={self.global_step}")
+    #     print(f"  Max Loss Scale: {loss_scale.max().item():.4f}")
+    #     print(f"  Min Loss Scale: {loss_scale.min().item():.4f}")
+    # # ===============
+    
     sigma = self._sigma_from_p(p[:,0].unsqueeze(-1))
 
     xt = self.q_xt(x0,
@@ -455,32 +611,89 @@ class Diffusion(L.LightningModule):
     x_input = torch.cat((xt, x0), dim=-1)
 
     model_output = self.forward(x_input, sigma=sigma)
+    # # === [Debug] ===
+    # if self.global_step % 10 == 0:
+    #     print(f"  Logits Max: {model_output.max().item():.4f}")
+    #     print(f"  Logits Min: {model_output.min().item():.4f}")
+    # # ===============
     utils.print_nans(model_output, 'model_output')
 
-    # 修改：Loss 计算适配 256 维 logits 和 Mapping
-    # 1. 准备 Targets: 将 x0 (Token IDs) 映射为 0-255
-    target_pixel_indices = self.vocab_map[x0] # [B, L]
+    # ================= 3. Soft Loss 计算 (核心修改部分) =================
+    # 3.1 准备目标数据
+    # 将 x0 (Token ID) 映射回 0-255 的像素值索引
+    target_pixel_indices = self.vocab_map[x0] # 形状 [B, L]
     
-    # 2. 处理非像素 Token (如 x0 中可能包含非 0-255 的特殊 token)
-    # 创建一个用于 gather 的 safe indices (将 -1 替换为 0，随后用 mask 过滤)
-    gather_indices = target_pixel_indices.clone()
+    # 3.2 处理无效目标 (Mask)
+    # 有些 token 可能不是像素 (比如 padding 或特殊符号)，它们在 vocab_map 中是 -1
+    # 我们先生成一个 mask，并在计算前把 -1 替换成 0 以免报错
     valid_target_mask = (target_pixel_indices != -1).float()
-    gather_indices[gather_indices == -1] = 0 
+    safe_targets = target_pixel_indices.clone()
+    safe_targets[safe_targets == -1] = 0 # 临时填0，计算完后会用 mask 乘掉
     
-    # 3. Gather Log Probs
-    log_p_theta = torch.gather(
+    # ----------------- 计算 Unweighted Loss (Hard NLL) -----------------
+    # 我们保留一份“原始”的 Loss，用于您在日志里看 BPP 指标
+    # 这代表了模型预测“准确数值”的能力，不包含平滑
+    log_p_hard = torch.gather(
       input=model_output,
       dim=-1,
-      index=gather_indices[:, :, None]).squeeze(-1)
+      index=safe_targets.unsqueeze(-1)).squeeze(-1)
     
-    # 4. 过滤无效 Target 的 Loss
-    log_p_theta = log_p_theta * valid_target_mask
+    unweighted_loss = log_p_hard * valid_target_mask
+
+    # ------------- 计算 Weighted Loss (Soft Cross Entropy) ------------
+    # [参数设置] 平滑的 sigma。
+    # sigma=0.5 比较尖锐（接近原始），sigma=2.0 比较平滑（容忍邻居）
+    smoothing_sigma = self._get_current_sigma()
+    self.log('train/sigma', smoothing_sigma, on_step=True, on_epoch=False, prog_bar=True)
     
-    weighted_loss = loss_scale * log_p_theta  # weighted cross entropy
-    unweighted_loss = -log_p_theta
+    # 创建 [0, 1, ..., 255] 的向量用于广播计算距离
+    pixel_range = torch.arange(256, device=model_output.device).view(1, 1, 256)
+    
+    # 扩展目标维度以便广播: [B, L, 1]
+    target_expand = safe_targets.unsqueeze(-1)
+    
+    # 计算高斯分布权重: exp( - (x - target)^2 / (2 * sigma^2) )
+    dist_sq = (pixel_range - target_expand) ** 2
+    soft_weights = torch.exp(-dist_sq / (2 * smoothing_sigma ** 2))
+    
+    # 归一化，使其成为一个合法的概率分布 (和为1)，“软目标” Q(x)
+    soft_targets = soft_weights / soft_weights.sum(dim=-1, keepdim=True)
+    
+    # 计算 Soft Cross Entropy: - Sum( Q(x) * LogP(x) )
+    # model_output 已经是 LogP(x)，计算了预测分布 P 和软目标 Q 之间的交叉熵
+    soft_ce = -(soft_targets * model_output).sum(dim=-1)
+    
+    # # 应用 Mask 和 Diffusion 的 Loss Scale
+    # weighted_loss = loss_scale * (-soft_ce * valid_target_mask)
+    
+    # 核心修复：只对被 Mask 的 Token 计算 Loss
+    # 1. 找出当前时间步 t 中，哪些位置是被 Mask 的 (需要预测的)
+    # xt 是加噪后的序列，self.mask_index 是 mask token 的 ID
+    is_masked = (xt == self.mask_index).float()
+    
+    # 2. 组合 Mask：(有效像素) AND (被 Mask 掉)
+    # valid_target_mask 负责过滤 Padding
+    # is_masked 负责过滤掉那些未被加噪、已知的部分 (避免 Soft Loss 冲突)
+    final_loss_mask = valid_target_mask * is_masked
+    
+    # 3. 应用 Loss Scale 和 Mask
+    weighted_loss = loss_scale * (-soft_ce * final_loss_mask)
+    
+    # # === [DEBUG] ===
+    # if self.global_step % 10 == 0:
+    #     # 计算 Mask 后的真实平均 Loss (只看被 mask 的部分)
+    #     masked_loss_sum = weighted_loss.sum()
+    #     mask_count = final_loss_mask.sum()
+    #     real_avg_loss = masked_loss_sum / (mask_count + 1e-6)
+        
+    #     print(f"\n[Debug] Step={self.global_step}")
+    #     print(f"  Raw Soft CE Max: {soft_ce.max().item():.2f} (Huge is expected!)")
+    #     print(f"  Masked Loss Sum: {masked_loss_sum.item():.4f}")
+    #     print(f"  Real Avg Loss:   {real_avg_loss.item():.4f} (Should be small, e.g. < 20)")
+    # # ===============
     
     return weighted_loss, unweighted_loss
-
+  
   def _sample_t(
       self, batch_dims, device, sampling_eps_min, sampling_eps_max, block_size=None):
     if block_size is None:
@@ -603,45 +816,46 @@ class Diffusion(L.LightningModule):
     sampling_eps_max_best = self.sampling_eps_max.item()
 
     for (eps_min, eps_max), var_list in self.metrics.valid_vars.items():
-        # var_list 是一个 list，长度为 batch_num，里面是 Tensor
-        # 1. 【本地合并】：先将 list 转为 Tensor [Batch_Size]
-        local_vars = torch.cat(var_list, dim=0).to(self.device)
-        
-        # 2. 【一次通信】：一次性把所有 GPU 的所有 Batch 数据拿过来
-        global_vars = self.all_gather(local_vars) 
-        
-        # 3. 【集中计算】：在拿到所有数据后，一次性计算方差
-        # 计算总方差，对应原逻辑：对每个 Batch (跨 GPU 收集后) 算方差，然后求和
-        # [World_Size, Num_Batches, Batch_items] -> permute -> [Num_Batches, World_Size, Batch_items]
-        # -> flatten(1) -> [Num_Batches, Total_Items_In_Batch]
-        if global_vars.dim() == 3:
-             # 假设 local_vars 是 [Num_Batches, Items]
-             combined = global_vars.permute(1, 0, 2).reshape(len(var_list), -1)
-             current_total_var = combined.var(dim=1).sum()
-        else:
-             # 无法确定维度，还是在本地循环计算
-             current_total_var = 0.0
-             # global_vars: [World_Size, Num_Batches, ...]
-             # 按 Batch 维度切分
-             num_batches = local_vars.shape[0]
-             for i in range(num_batches):
-                 # 取出第 i 个 batch 在所有 GPU 上的数据
-                 batch_data = global_vars[:, i, ...] 
-                 current_total_var += batch_data.var()
+      # var_list 是一个 list，长度为 batch_num，里面是 Tensor
+      # 1. 【本地合并】：先将 list 转为 Tensor [Batch_Size]
+      local_vars = torch.cat(var_list, dim=0).to(self.device)
+      
+      # 2. 【一次通信】：一次性把所有 GPU 的所有 Batch 数据拿过来
+      global_vars = self.all_gather(local_vars) 
+      
+      # 3. 【集中计算】：在拿到所有数据后，一次性计算方差
+      # 计算总方差，对应原逻辑：对每个 Batch (跨 GPU 收集后) 算方差，然后求和
+      # [World_Size, Num_Batches, Batch_items] -> permute -> [Num_Batches, World_Size, Batch_items]
+      # -> flatten(1) -> [Num_Batches, Total_Items_In_Batch]
+      if global_vars.dim() == 3:
+        # 假设 local_vars 是 [Num_Batches, Items]
+        combined = global_vars.permute(1, 0, 2).reshape(len(var_list), -1)
+        current_total_var = combined.var(dim=1).sum()
+      else:
+        # 无法确定维度，还是在本地循环计算
+        current_total_var = 0.0
+        # global_vars: [World_Size, Num_Batches, ...]
+        # 按 Batch 维度切分
+        num_batches = local_vars.shape[0]
+        for i in range(num_batches):
+          # 取出第 i 个 batch 在所有 GPU 上的数据
+          batch_data = global_vars[:, i, ...] 
+          current_total_var += batch_data.var()
 
-        if current_total_var < best_var:
-            best_var = current_total_var
-            sampling_eps_min_best = eps_min
-            sampling_eps_max_best = eps_max
-            
-        self.log(f'valid_var_{round(eps_min, 2)} - {round(eps_max, 2)}',
-                 current_total_var / len(var_list), # 原逻辑是除以 batch 数
-                 on_epoch=True,
-                 on_step=False,
-                 sync_dist=True)
+      if current_total_var < best_var:
+        best_var = current_total_var
+        sampling_eps_min_best = eps_min
+        sampling_eps_max_best = eps_max
+          
+      self.log(f'valid_var_{round(eps_min, 2)} - {round(eps_max, 2)}',
+              current_total_var / len(var_list), # 原逻辑是除以 batch 数
+              on_epoch=True,
+              on_step=False,
+              sync_dist=True)
 
-    self.sampling_eps_min.fill_(sampling_eps_min_best)
-    self.sampling_eps_max.fill_(sampling_eps_max_best)
+    if self.config.algo.fix_clipping == False:
+      self.sampling_eps_min.fill_(sampling_eps_min_best)
+      self.sampling_eps_max.fill_(sampling_eps_max_best)
   
   def _compute_entropy(self, x):
     _, counts = torch.unique(x, return_counts=True, sorted=False)
