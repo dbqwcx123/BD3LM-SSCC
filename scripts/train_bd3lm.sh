@@ -7,10 +7,11 @@ python train_bd3lm.py \
     model=small \
     algo=bd3lm \
     algo.backbone=hf_dit \
-    algo.clip_search_widths=[0.5,0.6,0.7,0.8,0.9] \
+    algo.clip_search_widths=[0.5,0.6,0.7] \
+    algo.fix_clipping=True \
     model.length=1024 \
     block_size=256 \
-    wandb.name=bd3lm-div2k-block_size256-260131 \
+    wandb.name=bd3lm-div2k-block_size256-260205 \
     mode=train \
     model.attn_backend=flex \
     training.resample=True \

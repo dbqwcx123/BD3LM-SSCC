@@ -4,7 +4,7 @@ defaults:
   - /model: small
   - /strategy: ddp
   - /noise: loglinear
-  - /lr_scheduler: cosine_decay_warmup
+  - /lr_scheduler: cosine_decay_warmup  # 改到 configure_optimizers 中实现
   - /algo: bd3lm
 
 mode: train  # train / sample_eval
@@ -15,7 +15,7 @@ seed: 42
 block_size: ${model.length}
 
 loader:
-  data_dir: /mnt/e/1Master1/0Science_Research/0DLM-SSCC/Dataset/DIV2K/DIV2K_LR_unified/X4
+  data_dir: /data_133/rtq/Dataset/DIV2K/DIV2K_LR_unified/X4
   global_batch_size: 512
   eval_global_batch_size: ${.global_batch_size}
   # Note: batch_size and eval_batch_size are **per machine**
@@ -26,14 +26,14 @@ loader:
 
 data:
   is_channel_wised: True  # RGB False; Gray True
-  tokenizer_name_or_path: /mnt/e/1Master1/0Science_Research/0DLM-SSCC/Model/gpt2
+  tokenizer_name_or_path: /data_133/rtq/Model/gpt2
 
 training:
-  from_pretrained: /mnt/e/1Master1/0Science_Research/0DLM-SSCC/Model/bd3lm/bd3lm-owt-block_size1024-pretrain
+  from_pretrained: /data_133/rtq/Model/bd3lm/bd3lm-owt-block_size1024-pretrain
   ema: 0.9999
   sampling_eps: 1e-3
-  sampling_eps_min: 1e-3
-  sampling_eps_max: 0.5
+  sampling_eps_min: 0.15
+  sampling_eps_max: 0.65
   resample: False
 
 optim:

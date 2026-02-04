@@ -1,10 +1,10 @@
 block_size=256
-python compress_bd3lm_optim.py \
+CUDA_VISIBLE_DIVICES=1 python compress_bd3lm_optim.py \
     algo.backbone=dit \
     algo.T=10 \
     block_size=${block_size} \
     loader.eval_batch_size=10 \
-    sampling.checkpoint_path=/data_133/rtq/BD3LM-SSCC/outputs/train/2026.01.28/173432/checkpoints/best.ckpt \
+    sampling.checkpoint_path=/data_133/rtq/BD3LM-SSCC/outputs/train/2026.02.01/001609/checkpoints/best.ckpt \
     sampling.first_hitting=False \
     sampling.reset_channel_context=True \
     model.length=1024 \

@@ -62,8 +62,10 @@ class FastPixelTokenizer:
         self.id_to_pixel = torch.zeros(tokenizer.vocab_size, dtype=torch.long, device=device)
         
         for i in range(256):
-            text = str(i)
-            token_id = tokenizer.convert_tokens_to_ids(text)
+            ids = tokenizer.encode(str(i), add_special_tokens=False)
+            assert len(ids) == 1, f"Error: Number {i} tokenizes to {ids}"
+            token_id = ids[0]
+            # token_id = tokenizer.convert_tokens_to_ids(str(i))
             self.pixel_to_id[i] = token_id
             self.id_to_pixel[token_id] = i
 
