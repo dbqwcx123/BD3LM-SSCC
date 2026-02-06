@@ -4,7 +4,7 @@ defaults:
   - /model: small
   - /strategy: ddp
   - /noise: loglinear
-  - /lr_scheduler: cosine_decay_warmup  # 改到 configure_optimizers 中实现
+  - /lr_scheduler: three_phase
   - /algo: bd3lm
 
 mode: train  # train / sample_eval
@@ -32,12 +32,12 @@ training:
   from_pretrained: /data_133/rtq/Model/bd3lm/bd3lm-owt-block_size1024-pretrain
   ema: 0.9999
   sampling_eps: 1e-3
-  sampling_eps_min: 0.15
-  sampling_eps_max: 0.65
+  sampling_eps_min: 0.35
+  sampling_eps_max: 0.85
   resample: False
 
 optim:
-  lr: 3e-4
+  lr: 1e-4
   beta1: 0.9
   beta2: 0.999
   eps: 1e-8
@@ -52,7 +52,7 @@ trainer:
   gradient_clip_val: 1.0
   precision: 'bf16-mixed'
   num_sanity_val_steps: 2
-  max_steps: 20720           # ~20 epochs
+  max_steps: 10360           # ~10 epochs
   log_every_n_steps: 1
   limit_train_batches: 1.0   # train on full dataset, can be used to toggle quick run
   limit_val_batches: 1.0     # validate on full dataset, can be used to toggle quick run

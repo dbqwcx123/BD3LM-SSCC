@@ -1,0 +1,7 @@
+_target_: utils.ThreePhaseLRScheduler
+total_steps: ${trainer.max_steps}
+
+# 三阶段比例配置
+warmup_ratio: 0.1    # 前 10% 预热
+constant_ratio: 0.3  # 中间 30% 保持常数
+# 剩余 60% 自动为 Cosine Decay

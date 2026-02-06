@@ -105,6 +105,61 @@ class Diffusion(L.LightningModule):
 
     self.noise = noise_schedule.get_noise(self.config)
     self.metrics = metrics.Metrics(config)
+    
+    # 预计算 Pixel Token IDs 和 Vocab Map
+    pixel_ids_list = []
+    for i in range(256):
+        # 将 '0'-'255' 字符串转为对应的 ID
+        ids = tokenizer.encode(str(i), add_special_tokens=False)
+        assert len(ids) == 1, f"Error: Number {i} tokenizes to {ids}"
+        pixel_ids_list.append(ids[0])
+    self.register_buffer('pixel_token_ids', torch.tensor(pixel_ids_list, dtype=torch.long))
+    
+    # 创建全词表到 0-255 的映射表 (默认为 -1)
+    vocab_map_tensor = torch.full((self.vocab_size,), -1, dtype=torch.long)
+    for i, pid in enumerate(pixel_ids_list):
+        if pid < self.vocab_size:
+            vocab_map_tensor[pid] = i
+    self.register_buffer('vocab_map', vocab_map_tensor)
+
+    # ================== 改进方案 1: Embedding 重构 ==================
+    # [目标] 让 Pixel Token (0-255) 的向量具备数学上的连续性 (拓扑结构)
+    # [策略] 使用正弦编码覆盖原有权重，并强制冻结，使其像"尺子"一样固定
+    
+    # 1. 获取 Input Embedding 层
+    embedding_layer = self.backbone.backbone.vocab_embed.embedding 
+    hidden_dim = embedding_layer.shape[1]
+
+    # 2. 计算正弦编码 (Sinusoidal Position Encoding 风格)
+    # 形状: [256, hidden_dim]
+    position = torch.arange(256).unsqueeze(1).float()
+    div_term = torch.exp(torch.arange(0, hidden_dim, 2).float() * -(math.log(10000.0) / hidden_dim))
+    
+    sinusoidal_embed = torch.zeros(256, hidden_dim)
+    sinusoidal_embed[:, 0::2] = torch.sin(position * div_term)
+    sinusoidal_embed[:, 1::2] = torch.cos(position * div_term)
+
+    # 3. 覆盖权重 & 强制绑定 & 冻结
+    with torch.no_grad():
+        ids = self.pixel_token_ids.to(embedding_layer.device) 
+        sinusoidal_embed = sinusoidal_embed.to(embedding_layer.device)
+        
+        # A. 覆盖 Input Embedding 中对应的 Pixel Token
+        embedding_layer[ids] = sinusoidal_embed
+        
+        # B. [核心优化] 强制 Weight Tying (权重绑定)
+        # 直接让 Output Layer 的权重指向 Input Embedding 的内存对象
+        # 这样无需手动拷贝数值，且能保证输入输出逻辑绝对一致
+        output_linear = self.backbone.backbone.output_layer.linear
+        output_linear.weight = embedding_layer 
+        
+        # C. [关键步骤] 冻结这两层
+        embedding_layer.requires_grad = False
+        
+        print(f"[Optimization] Initialized Pixel Embeddings (0-255) with Sinusoidal structure.")
+        print(f"[Optimization] Enforced Weight Tying & FROZEN weights to preserve topology.")
+
+    # =============================================================
 
     self.ema = models.ema.ExponentialMovingAverage(
       self._get_parameters(),
@@ -116,68 +171,6 @@ class Diffusion(L.LightningModule):
       self.config.training.sampling_eps_max))
     
     self.neg_infinity = -1000000.0
-    
-    # 1. 预计算 Pixel Token IDs 和 Vocab Map
-    
-    pixel_ids_list = []
-    for i in range(256):
-        # 将 '0'-'255' 字符串转为对应的 ID
-        ids = tokenizer.encode(str(i), add_special_tokens=False)
-        assert len(ids) == 1, f"Error: Number {i} tokenizes to {ids}"
-        pixel_ids_list.append(ids[0])
-        # pixel_ids_list.append(self.tokenizer.convert_tokens_to_ids(str(i)))
-    
-    # 注册 buffer，会自动随模型移动到 GPU
-    self.register_buffer('pixel_token_ids', torch.tensor(pixel_ids_list, dtype=torch.long))
-    
-    # 创建全词表到 0-255 的映射表 (默认为 -1)
-    vocab_map_tensor = torch.full((self.vocab_size,), -1, dtype=torch.long)
-    for i, pid in enumerate(pixel_ids_list):
-        if pid < self.vocab_size:
-            vocab_map_tensor[pid] = i
-    self.register_buffer('vocab_map', vocab_map_tensor)
-    
-    # ================== 改进方案 1: Embedding 重构 ==================
-    # 目的：让 token "128" 和 "129" 的向量由于数学特性天然相似
-    # 获取模型原本的 embedding 层引用 (根据 modeling_bd3lm.py 结构)
-    # BD3LM -> DITBackbone -> EmbeddingLayer -> nn.Parameter
-    embedding_layer = self.backbone.backbone.vocab_embed.embedding 
-    hidden_dim = embedding_layer.shape[1]
-
-    # 创建正弦编码 (Sinusoidal Position Encoding 风格)，[256, hidden_dim]
-    position = torch.arange(256).unsqueeze(1).float()
-    div_term = torch.exp(torch.arange(0, hidden_dim, 2).float() * -(math.log(10000.0) / hidden_dim))
-    sinusoidal_embed = torch.zeros(256, hidden_dim)
-    sinusoidal_embed[:, 0::2] = torch.sin(position * div_term)
-    sinusoidal_embed[:, 1::2] = torch.cos(position * div_term)
-
-    # 强制覆盖预训练模型中对应的 Token Embedding
-    # 注意：这会破坏该 Token 原本的文本语义，但对于纯像素压缩任务是正向的
-    with torch.no_grad():
-        ids = self.pixel_token_ids.to(embedding_layer.device) 
-        sinusoidal_embed = sinusoidal_embed.to(embedding_layer.device)
-        
-        # 1. 覆盖 Input Embedding
-        embedding_layer[ids] = sinusoidal_embed
-        
-        # 2. 同步 Output Layer 权重
-        output_weight = self.backbone.backbone.output_layer.linear.weight
-        # 检查是否已经是共享权重 (Weight Tying)
-        if embedding_layer.data_ptr() == output_weight.data_ptr():
-          print("[Info] Weights are tied. Output layer is already updated.")
-        else:
-          print("[Optimization] Syncing output layer weights with Sinusoidal embeddings...")
-          # 确保形状匹配 (通常都是 [50257, Hidden])
-          if output_weight.shape == embedding_layer.shape:
-            output_weight[ids] = embedding_layer[ids]
-          else:
-            # 防止形状转置的情况 (虽然在HF GPT2实现中很少见，但为了稳健)
-            output_weight[ids, :] = embedding_layer[ids, :]
-          print("[Optimization] Output layer synced.")
-
-    print("[Optimization] Re-initialized Pixel Embeddings & Output Weights with Sinusoidal structure.")
-    # =============================================================
-
 
 # __init__方法中用到的自定义函数
   def _get_parameters(self):
@@ -297,12 +290,15 @@ class Diffusion(L.LightningModule):
     # 记录详细指标
     # 1. Weighted CE (优化目标, NLL Estimate)
     weighted_ce = losses.loss
-    # 2. BPP (Bits Per Pixel)
+    # 2. Unweighted CE (单纯的预测难度)
+    unweighted_ce = losses.unweighted_loss
+    # 3. BPP (Bits Per Pixel)
     #    BPP = NLL (nats) / ln(2)
     bpp = weighted_ce / 0.69314718056
     
     self.log_dict({
         'train/loss': weighted_ce,
+        'train/unweighted_loss': unweighted_ce,
         'train/bpp': bpp
     }, on_step=True, on_epoch=False, sync_dist=True, prog_bar=True)
     
@@ -342,120 +338,45 @@ class Diffusion(L.LightningModule):
             nlls.shape[0], -1, self.block_size).mean(-1))
     self.metrics.valid_nlls.update(losses.nlls, losses.token_mask)
     
-    # 显式记录 Val 指标
     weighted_ce = losses.loss
     bpp = weighted_ce / 0.69314718056
+    unweighted_ce = losses.unweighted_loss
+    hard_bpp = unweighted_ce / 0.69314718056
     
     self.log_dict({
         'val/loss': weighted_ce,
-        'val/bpp': bpp
+        'val/bpp_soft': bpp,
+        'val/unweighted_loss': unweighted_ce,
+        'val/bpp_real': hard_bpp
     }, on_step=False, on_epoch=True, sync_dist=True)
     
     return losses.loss
 
   def configure_optimizers(self):
-    # 1. ------------- 差分学习率策略 (Differential LR) -------------
-    # 将参数分为两组：Backbone (预训练部分) 和 New Layers (新初始化的Embedding/Head)
-    # 假设你的配置文件中有 self.config.optim.lr 作为基础学习率
-    base_lr = self.config.optim.lr
-    backbone_lr_ratio = 0.3  # Backbone 学习率是基础学习率的 0.3 倍
-    
-    backbone_params = []
-    new_params = []
-    
-    # 关键词匹配：根据实际打印出的 named_parameters 调整这里的关键词
-    modules = [name for name, _ in self.named_parameters()]
-    target_new_modules = ['vocab_embed.embedding', 'output_layer.linear']
-    
-    for name, param in self.named_parameters():
-      if not param.requires_grad:
-        continue
-      
-      # 检查参数名是否包含新层的关键词
-      is_new = any(k in name for k in target_new_modules)
-      
-      if is_new:
-        # print(f"  -> High LR (New): {name}")
-        new_params.append(param)
-      else:
-        backbone_params.append(param)
-    # print(f"[Optimizer] Summary: {len(new_params)} params in New Group (High LR), {len(backbone_params)} params in Backbone Group (Low LR).\n")
-    # 创建参数组
-    optimizer_groups = [
-      # 组1：Backbone，使用较小的学习率
-      {'params': backbone_params, 'lr': base_lr * backbone_lr_ratio},
-      # 组2：新层，使用全速学习率
-      {'params': new_params, 'lr': base_lr}
-    ]
-
+    # 1. ------------- 优化器配置 -------------
+    params_to_optimize = filter(lambda p: p.requires_grad, self.parameters())
     optimizer = torch.optim.AdamW(
-      optimizer_groups, # 传入参数组而非全部参数
+      params_to_optimize,
+      lr=self.config.optim.lr,
       betas=(self.config.optim.beta1, self.config.optim.beta2),
       eps=self.config.optim.eps,
       weight_decay=self.config.optim.weight_decay
     )
 
-    # 2. ------------- 自定义调度器 (Warmup -> Constant -> Decay) -------------
-    # 我们放弃 hydra 的自动实例化，改用 LambdaLR 手写逻辑
-    # 假设总步数从 trainer 获取 (如果不方便获取，可以在 config 里硬编码 max_steps)
+    # 2. ------------- 调度器实例化 -------------
+    scheduler_args = {"optimizer": optimizer}
     if self.trainer.max_steps and self.trainer.max_steps > 0:
-      total_steps = self.trainer.max_steps
-    else:
-      total_steps = self.config.training.max_steps # 备选方案，取决于你的config结构
+         scheduler_args["total_steps"] = self.trainer.max_steps
+    elif hasattr(self.config.trainer, 'max_steps'):
+         scheduler_args["total_steps"] = self.config.trainer.max_steps
 
-    # 定义阶段比例
-    warmup_ratio = 0.1  # 前 10% Warmup
-    constant_ratio = 0.3 # 接下来 30% 保持 Constant
-    # 剩余为 Decay
-    
-    warmup_steps = int(total_steps * warmup_ratio)
-    constant_end_step = int(total_steps * (warmup_ratio + constant_ratio))
-
-    def lr_lambda(current_step):
-      # 阶段 1: Warmup
-      if current_step < warmup_steps:
-        return float(current_step) / float(max(1, warmup_steps))
-      
-      # 阶段 2: Constant (保持 1.0 倍率)
-      elif current_step < constant_end_step:
-        return 1.0
-      
-      # 阶段 3: Decay (Cosine Decay 到 0)
-      else:
-        progress = float(current_step - constant_end_step) / float(max(1, total_steps - constant_end_step))
-        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
-
-    scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
-
-    scheduler_dict = {
-        'scheduler': scheduler,
-        'interval': 'step',
-        'monitor': 'val/loss',
-        'name': 'trainer/lr'
-    }
-    
+    scheduler = hydra.utils.instantiate(
+      self.config.lr_scheduler, **scheduler_args)
+    scheduler_dict = {'scheduler': scheduler,
+                      'interval': 'step',
+                      'monitor': 'val/loss',
+                      'name': 'trainer/lr'}
     return [optimizer], [scheduler_dict]
-
-  # def configure_optimizers(self):
-  #   # TODO(yair): Lightning currently giving this warning when using `fp16`:
-  #   #  "Detected call of `lr_scheduler.step()` before `optimizer.step()`. "
-  #   #  Not clear if this is a problem or not.
-  #   #  See: https://github.com/Lightning-AI/pytorch-lightning/issues/5558
-  #   optimizer = torch.optim.AdamW(
-  #     self._get_parameters(),
-  #     lr=self.config.optim.lr,
-  #     betas=(self.config.optim.beta1,
-  #            self.config.optim.beta2),
-  #     eps=self.config.optim.eps,
-  #     weight_decay=self.config.optim.weight_decay)
-
-  #   scheduler = hydra.utils.instantiate(
-  #     self.config.lr_scheduler, optimizer=optimizer)
-  #   scheduler_dict = {'scheduler': scheduler,
-  #                     'interval': 'step',
-  #                     'monitor': 'val/loss',
-  #                     'name': 'trainer/lr'}
-  #   return [optimizer], [scheduler_dict]
 
 # 自定义函数
   def _replace_ckpt_keys(self, checkpoint):
@@ -529,14 +450,14 @@ class Diffusion(L.LightningModule):
     
     # 计算 Weighted Mean (NLL)
     nlls = (weighted_loss_map * attention_mask)
-    token_nll = nlls.sum() / attention_mask.sum()
+    weighted_nlls = nlls.sum() / attention_mask.sum()
     # 计算 Unweighted Mean
-    unweighted_nlls_scalar = (unweighted_loss_map * attention_mask).sum() / attention_mask.sum()
+    unweighted_nlls = (unweighted_loss_map * attention_mask).sum() / attention_mask.sum()
     
-    return Loss(loss=token_nll,
+    return Loss(loss=weighted_nlls,
                 nlls=nlls,
                 token_mask=attention_mask,
-                unweighted_loss=unweighted_nlls_scalar)
+                unweighted_loss=unweighted_nlls)
 
   def _maybe_sub_sample(self, x0, attention_mask):
     seqlen = x0.shape[1]
@@ -585,40 +506,26 @@ class Diffusion(L.LightningModule):
                          x0.device,
                          sampling_eps_min,
                          sampling_eps_max)
-
     loss_scale, p = self.noise(t)
+    if sampling_eps_min is not None and sampling_eps_min > 0.5:
+      loss_scale = - torch.ones_like(loss_scale)
     
-    # # === [Debug] ===
-    # if self.global_step % 10 == 0:
-    #     print(f"\n[Debug] Step={self.global_step}")
-    #     print(f"  Max Loss Scale: {loss_scale.max().item():.4f}")
-    #     print(f"  Min Loss Scale: {loss_scale.min().item():.4f}")
-    # # ===============
-    
-    sigma = self._sigma_from_p(p[:,0].unsqueeze(-1))
-
+    # ===================== 2. 计算 xt =====================
     xt = self.q_xt(x0,
                    p,
                    sampling_eps_min=sampling_eps_min,
                    sampling_eps_max=sampling_eps_max)
-    if sampling_eps_min is not None and sampling_eps_min > 0.5:
-      loss_scale = - torch.ones_like(loss_scale)
-      
     # 从全 MASK 序列开始预测，无需 bos
     # xt[:, 0] = x0[:, 0]  # 保留起始 token 不被加噪
-    
     x_input = xt
     x_input = torch.cat((xt, x0), dim=-1)
+    
+    sigma = self._sigma_from_p(p[:,0].unsqueeze(-1))
 
     model_output = self.forward(x_input, sigma=sigma)
-    # # === [Debug] ===
-    # if self.global_step % 10 == 0:
-    #     print(f"  Logits Max: {model_output.max().item():.4f}")
-    #     print(f"  Logits Min: {model_output.min().item():.4f}")
-    # # ===============
     utils.print_nans(model_output, 'model_output')
 
-    # ================= 3. Soft Loss 计算 (核心修改部分) =================
+    # =========== 3. Soft Loss 计算 (核心修改部分) ===========
     # 3.1 准备目标数据
     # 将 x0 (Token ID) 映射回 0-255 的像素值索引
     target_pixel_indices = self.vocab_map[x0] # 形状 [B, L]
@@ -631,14 +538,14 @@ class Diffusion(L.LightningModule):
     safe_targets[safe_targets == -1] = 0 # 临时填0，计算完后会用 mask 乘掉
     
     # ----------------- 计算 Unweighted Loss (Hard NLL) -----------------
-    # 我们保留一份“原始”的 Loss，用于您在日志里看 BPP 指标
+    # 保留一份“原始”的 Loss，用于在日志里看 BPP 指标
     # 这代表了模型预测“准确数值”的能力，不包含平滑
     log_p_hard = torch.gather(
       input=model_output,
       dim=-1,
       index=safe_targets.unsqueeze(-1)).squeeze(-1)
     
-    unweighted_loss = log_p_hard * valid_target_mask
+    unweighted_loss = -log_p_hard * valid_target_mask
 
     # ------------- 计算 Weighted Loss (Soft Cross Entropy) ------------
     # [参数设置] 平滑的 sigma。
@@ -677,20 +584,7 @@ class Diffusion(L.LightningModule):
     final_loss_mask = valid_target_mask * is_masked
     
     # 3. 应用 Loss Scale 和 Mask
-    weighted_loss = loss_scale * (-soft_ce * final_loss_mask)
-    
-    # # === [DEBUG] ===
-    # if self.global_step % 10 == 0:
-    #     # 计算 Mask 后的真实平均 Loss (只看被 mask 的部分)
-    #     masked_loss_sum = weighted_loss.sum()
-    #     mask_count = final_loss_mask.sum()
-    #     real_avg_loss = masked_loss_sum / (mask_count + 1e-6)
-        
-    #     print(f"\n[Debug] Step={self.global_step}")
-    #     print(f"  Raw Soft CE Max: {soft_ce.max().item():.2f} (Huge is expected!)")
-    #     print(f"  Masked Loss Sum: {masked_loss_sum.item():.4f}")
-    #     print(f"  Real Avg Loss:   {real_avg_loss.item():.4f} (Should be small, e.g. < 20)")
-    # # ===============
+    weighted_loss = -loss_scale * (soft_ce * final_loss_mask)
     
     return weighted_loss, unweighted_loss
   

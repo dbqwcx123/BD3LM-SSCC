@@ -13,6 +13,7 @@ import fsspec
 import lightning
 import torch
 from timm.scheduler import CosineLRScheduler
+from torch.optim.lr_scheduler import LambdaLR
 
 
 def count_parameters(model):
@@ -75,6 +76,42 @@ class CosineDecayWarmupLRScheduler(
     else:
       super().step_update(num_updates=self._last_epoch)
 
+
+class ThreePhaseLRScheduler(LambdaLR):
+    """
+    实现了 Warmup -> Constant -> Cosine Decay 的三阶段学习率调度器。
+    """
+    def __init__(self, optimizer, total_steps, warmup_ratio=0.1, constant_ratio=0.3, last_epoch=-1, verbose=False, **kwargs):
+        # **kwargs: 接收并忽略 YAML 中可能残留的其他参数 (如 t_in_epochs, warmup_lr_init 等)
+        
+        self.total_steps = int(total_steps)
+        self.warmup_steps = int(total_steps * warmup_ratio)
+        self.constant_end_step = int(total_steps * (warmup_ratio + constant_ratio))
+        
+        # [核心修复] 
+        # 移除 verbose 参数的传递，因为旧版 PyTorch 的 LambdaLR 不支持它。
+        # 即使新版支持，LambdaLR 的 verbose 打印通常不是必须的。
+        super().__init__(optimizer, self.lr_lambda, last_epoch)
+
+    def lr_lambda(self, current_step):
+        # 阶段 1: Warmup (线性增长 0 -> 1)
+        if current_step < self.warmup_steps:
+            return float(current_step) / float(max(1, self.warmup_steps))
+        
+        # 阶段 2: Constant (保持 1.0)
+        elif current_step < self.constant_end_step:
+            return 1.0
+        
+        # 阶段 3: Decay (余弦衰减 1.0 -> 0.0)
+        else:
+            decay_steps = self.total_steps - self.constant_end_step
+            current_decay_step = current_step - self.constant_end_step
+            progress = float(current_decay_step) / float(max(1, decay_steps))
+            
+            if progress > 1.0: 
+                return 0.0
+            
+            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
 class LoggingContext:
   """Context manager for selective logging."""
