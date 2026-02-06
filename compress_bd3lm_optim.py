@@ -297,7 +297,6 @@ def _load_from_checkpoint(config, tokenizer, device):
     model = diffusion_inf.Diffusion(config, tokenizer=tokenizer)
     
     # 构造中间层 BD3LM，并进行替换
-    # push_to_hf 的逻辑
     bd3lm_config = BD3LMConfig(
         block_size=config.block_size,
         vocab_size=tokenizer.vocab_size+1,
@@ -311,22 +310,75 @@ def _load_from_checkpoint(config, tokenizer, device):
         time_conditioning=False,
         return_dict=False
     )
-    bd3lm_backbone = BD3LM(bd3lm_config)
-    
+    bd3lm_backbone = BD3LM(bd3lm_config)    
     # 将 Diffusion 的 backbone 替换为 BD3LM
     # Diffusion(model) -> BD3LM(model.backbone) -> DIT(model.backbone.backbone)
     model.backbone = bd3lm_backbone
     
-    ckpt = torch.load(config.sampling.checkpoint_path, map_location='cpu', weights_only=False)
-    state_dict = ckpt['state_dict']
+    # 预先应用 Weight Tying，让模型结构在物理上支持参数共享
+    embedding_tensor = model.backbone.backbone.vocab_embed.embedding 
+    output_linear = model.backbone.backbone.output_layer.linear
+    output_linear.weight = embedding_tensor
     
     model = model.to(device)
-    model.load_state_dict(state_dict, strict=False)
-    ema_params = ckpt['ema']['shadow_params']
-    for s_param, param in zip(ema_params, model.parameters()):
-        if param.requires_grad:
-            param.data.copy_(s_param.data)
 
+    # 3. 加载 Checkpoint
+    ckpt = torch.load(config.sampling.checkpoint_path, map_location='cpu', weights_only=False)
+    state_dict = ckpt['state_dict']
+    model.load_state_dict(state_dict, strict=False)
+    
+    # ema_params = ckpt['ema']['shadow_params']
+    # for s_param, param in zip(ema_params, model.parameters()):
+    #     if param.requires_grad:
+    #         param.data.copy_(s_param.data)
+    
+    # 4. [核心修复] 重建 EMA State Dict (按名称而非位置加载)
+    ema_params_list = ckpt['ema']['shadow_params']
+    ema_state_dict = {}
+    ema_idx = 0
+    embedding_ema_tensor = None
+    
+    keys_in_ckpt = list(state_dict.keys())
+    for key in keys_in_ckpt:
+        if 'num_batches_tracked' in key or 'running_' in key:
+            ema_state_dict[key] = state_dict[key]
+            continue
+            
+        # 特殊处理 Weight Tying：Output Layer
+        if 'output_layer.linear.weight' in key:
+            if embedding_ema_tensor is not None:
+                ema_state_dict[key] = embedding_ema_tensor
+            continue
+
+        # 特殊处理 Weight Tying：Embedding Layer
+        if 'vocab_embed.embedding.weight' in key:
+            if ema_idx < len(ema_params_list):
+                tensor = ema_params_list[ema_idx]
+                ema_state_dict[key] = tensor
+                embedding_ema_tensor = tensor # 存下来给 Output Layer 用
+                ema_idx += 1
+            continue
+
+        # 其他普通参数
+        if ema_idx < len(ema_params_list):
+            # 检查形状是否匹配，作为安全网
+            saved_tensor = state_dict[key]
+            ema_tensor = ema_params_list[ema_idx]
+            
+            if saved_tensor.shape == ema_tensor.shape:
+                ema_state_dict[key] = ema_tensor
+                ema_idx += 1
+            else:
+                ema_state_dict[key] = state_dict[key]
+        else:
+            ema_state_dict[key] = state_dict[key]
+
+    print(f"Constructed EMA state_dict. Consumed {ema_idx}/{len(ema_params_list)} EMA params.")
+    
+    # 5. 加载重构后的 EMA 权重
+    missing, unexpected = model.load_state_dict(ema_state_dict, strict=False)
+    print(f"EMA Loaded. Missing: {missing}, Unexpected: {unexpected}")
+    
     return model
 
 @hydra.main(version_base=None, config_path='configs', config_name='config_inf')
@@ -357,7 +409,7 @@ def main(config):
                     patch_size=config.data.patch_size,
                     num_chunks=config.data.num_patches_test,
                     is_channel_wised=config.data.is_channel_wised,
-                    is_seq=False, 
+                    is_seq=True, 
                     data_path=test_dataset_path)
 
     # 3. 执行压缩任务

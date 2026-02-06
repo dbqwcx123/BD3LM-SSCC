@@ -68,6 +68,24 @@ class Diffusion(L.LightningModule):
 
     self.noise = noise_schedule.get_noise(self.config)
 
+    # =========================================================================
+    # 1. 预计算 Pixel Token IDs
+    pixel_ids_list = []
+    for i in range(256):
+        # 将 '0'-'255' 字符串转为对应的 ID
+        ids = self.tokenizer.encode(str(i), add_special_tokens=False)
+        assert len(ids) == 1, f"Error: Number {i} tokenizes to {ids}"
+        pixel_ids_list.append(ids[0])
+    self.register_buffer('pixel_token_ids', torch.tensor(pixel_ids_list, dtype=torch.long))
+    
+    # 2. 创建 Vocab Map (用于推理时的 _subs_parameterization)
+    vocab_map_tensor = torch.full((self.vocab_size,), -1, dtype=torch.long)
+    for i, pid in enumerate(pixel_ids_list):
+        if pid < self.vocab_size:
+            vocab_map_tensor[pid] = i
+    self.register_buffer('vocab_map', vocab_map_tensor)
+    # ==========================================================================
+    
     self.neg_infinity = -1000000.0
 
 
