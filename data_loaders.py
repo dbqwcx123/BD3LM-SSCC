@@ -296,13 +296,13 @@ class Div2kPatchDataset(Dataset):
         # 数据增广
         if split == 'train':
             self.transform = transforms.Compose([
-                transforms.RandomCrop(size=(4, 256)),
+                transforms.RandomCrop(size=(32, 32)),
                 transforms.RandomHorizontalFlip(p=0.5),
-                # transforms.RandomVerticalFlip(p=0.5),
+                transforms.RandomVerticalFlip(p=0.5),
             ])
         else:
             self.transform = transforms.Compose([
-                transforms.CenterCrop(size=(4, 256)),
+                transforms.CenterCrop(size=(32, 32)),
             ])
 
     def process_patch_to_tokens(self, patch):
