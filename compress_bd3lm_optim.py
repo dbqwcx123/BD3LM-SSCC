@@ -410,6 +410,7 @@ def main(config):
                     num_chunks=config.data.num_patches_test,
                     is_channel_wised=config.data.is_channel_wised,
                     is_seq=True, 
+                    stripe_width=config.data.stripe_width,
                     data_path=test_dataset_path)
 
     # 3. 执行压缩任务

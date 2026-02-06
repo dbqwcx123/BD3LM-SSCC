@@ -9,7 +9,7 @@ diffusion: absorbing_state
 
 seed: 42
 
-block_size: 64
+block_size: 16
 
 data:
   dataset_root: /data_133/rtq/Dataset
@@ -18,6 +18,7 @@ data:
   num_images_test: 1
   is_channel_wised: True  # RGB False; Gray True
   patch_size: ${sqrt:${block_size}}
+  stripe_width: 8
   num_patches_test: ${compute_num_patches:${data.num_images_test},${data.image_size_test},${data.patch_size}}
   tokenizer_name_or_path: /data_133/rtq/Model/gpt2
   ac_coder_base: 2

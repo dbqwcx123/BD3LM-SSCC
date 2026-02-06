@@ -59,6 +59,23 @@ def _extract_image_sequence(image: np.ndarray, patch_size: int) -> Iterator[byte
     yield temp_sequence.reshape(h, w, image.shape[-1])
 
 
+# 垂直条带提取器
+def _extract_image_stripes(image: np.ndarray, stripe_width: int) -> Iterator[np.ndarray]:
+  """
+  将图像切割成固定宽度的垂直条带
+  image: (H, W, C)
+  yield: (H, stripe_width, C)
+  """
+  height, width = image.shape[0], image.shape[1]
+  num_stripes = math.ceil(width / stripe_width)
+  
+  for i in range(num_stripes):
+    start_col = i * stripe_width
+    end_col = min((i + 1) * stripe_width, width)
+    # 提取条带
+    stripe = image[:, start_col:end_col, :]
+    yield stripe
+
 
 def _get_image_dataset(data_path):
   """
@@ -87,6 +104,7 @@ def get_image_iterator(
     num_chunks: int = -1,
     is_channel_wised: bool = True,
     is_seq: bool = False,
+    stripe_width: int = None,
     data_path: str = None,
 ) -> Iterator[bytes]:
   """
@@ -97,22 +115,31 @@ def get_image_iterator(
   image_extractor = _extract_image_sequence if is_seq else _extract_image_patches
   
   for data, img_id in image_dataset:
-    if is_channel_wised:
-      # 遍历3个颜色通道 (R, G, B)
-      for i in range(data.shape[-1]):
-        temp_data = data[:, :, i:i+1]
-        for patch in image_extractor(temp_data, patch_size):
-          if idx >= num_chunks and num_chunks > 0: # 增加 num_chunks > 0 判断，方便全量训练
+    # --- 条带化逻辑分流 ---
+    if stripe_width is not None:
+      # 先切条带，再对每个条带提取 patch
+      stripes = _extract_image_stripes(data, stripe_width)
+    else:
+      # 不切条带，直接处理全图
+      stripes = [data]
+    
+    for stripe in stripes:
+      if is_channel_wised:
+        # 遍历3个颜色通道 (R, G, B)
+        for i in range(stripe.shape[-1]):
+          temp_data = stripe[:, :, i:i+1]
+          for patch in image_extractor(temp_data, patch_size):
+            if idx >= num_chunks and num_chunks > 0: # 增加 num_chunks > 0 判断，方便全量训练
+              return
+            yield patch, img_id
+            idx += 1
+      else:
+        # 整体 RGB 处理 (H, W, 3) -> (16, 16, 3) patches
+        for patch in image_extractor(stripe, patch_size):
+          if idx >= num_chunks and num_chunks > 0:
             return
           yield patch, img_id
           idx += 1
-    else:
-      # 整体 RGB 处理 (H, W, 3) -> (16, 16, 3) patches
-      for patch in image_extractor(data, patch_size):
-        if idx >= num_chunks and num_chunks > 0:
-          return
-        yield patch, img_id
-        idx += 1
 
 
 def patch_visualize(patch_data, save_path, patch_name):
