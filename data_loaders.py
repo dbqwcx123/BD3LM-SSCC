@@ -41,109 +41,106 @@ import typing
 import math
 
 def _extract_image_patches(image: np.ndarray, patch_size: int) -> Iterator[bytes]:
-    h, w = patch_size, patch_size
-    height, width = image.shape[0], image.shape[1]
-    for row, col in itertools.product(range(height // h), range(width // w)):  # 效果等同于两个嵌套for循环
-        yield image[row * h: (row + 1) * h, col * w: (col + 1) * w]
+  h, w = patch_size, patch_size
+  height, width = image.shape[0], image.shape[1]
+  for row, col in itertools.product(range(height // h), range(width // w)):  # 效果等同于两个嵌套for循环
+    yield image[row * h: (row + 1) * h, col * w: (col + 1) * w]
         
 
 def _extract_image_sequence(image: np.ndarray, patch_size: int) -> Iterator[bytes]:
-    h, w = patch_size, patch_size
-    height, width = image.shape[0], image.shape[1]
-    total_pixels = height * width
-    sequence_length = h * w
-    total_chunks = total_pixels // sequence_length
-    image_sequence = image.reshape(-1, image.shape[-1])
-    for i in range(total_chunks):
-        temp_sequence = image_sequence[i * sequence_length: (i + 1) * sequence_length]
-        yield temp_sequence.reshape(h, w, image.shape[-1])
+  h, w = patch_size, patch_size
+  height, width = image.shape[0], image.shape[1]
+  total_pixels = height * width
+  sequence_length = h * w
+  total_chunks = total_pixels // sequence_length
+  image_sequence = image.reshape(-1, image.shape[-1])
+  for i in range(total_chunks):
+    temp_sequence = image_sequence[i * sequence_length: (i + 1) * sequence_length]
+    yield temp_sequence.reshape(h, w, image.shape[-1])
 
 
 
 def _get_image_dataset(data_path):
-    """
-    遍历数据集目录，逐张读取图像
-    """
-    if not os.path.exists(data_path):
-        raise ValueError(f"Data path {data_path} does not exist.")
-    
-    img_files = [os.path.join(data_path, item) for item in os.listdir(data_path)]
-    img_files = natsorted(img_files)
-    
-    
-    filet_count = 0
-    for file in img_files:
-        test = imageio.imread_v2(file)
+  """
+  遍历数据集目录，逐张读取图像
+  """
+  if not os.path.exists(data_path):
+    raise ValueError(f"Data path {data_path} does not exist.")
+  
+  img_files = [os.path.join(data_path, item) for item in os.listdir(data_path)]
+  img_files = natsorted(img_files)
+  
+  filet_count = 0
+  for file in img_files:
+    test = imageio.imread_v2(file)
 
-        # 检查图像是否为三通道，即RGB图像
-        if test.shape[-1] != 3:
-            continue
+    # 检查图像是否为三通道，即RGB图像
+    if test.shape[-1] != 3:
+        continue
 
-        yield test, filet_count  # 逐个生成数据，返回图像和编号（类似于逐个return）
-        filet_count += 1
+    yield test, filet_count  # 逐个生成数据，返回图像和编号（类似于逐个return）
+    filet_count += 1
 
 
 def get_image_iterator(
-        patch_size: int = -1,
-        num_chunks: int = -1,
-        is_channel_wised: bool = True,
-        is_seq: bool = False,
-        data_path: str = None,
+    patch_size: int = -1,
+    num_chunks: int = -1,
+    is_channel_wised: bool = True,
+    is_seq: bool = False,
+    data_path: str = None,
 ) -> Iterator[bytes]:
-    """
-    获取数据集的 Patch 迭代器
-    """
-
-    image_dataset = _get_image_dataset(data_path)
-    idx = 0
-    image_extractor = _extract_image_sequence if is_seq else _extract_image_patches
-    
-    for data, img_id in image_dataset:
-        if is_channel_wised:
-            # 遍历3个颜色通道 (R, G, B)
-            for i in range(data.shape[-1]):
-                temp_data = data[:, :, i:i+1]
-                for patch in image_extractor(temp_data, patch_size):
-                    if idx >= num_chunks and num_chunks > 0: # 增加 num_chunks > 0 判断，方便全量训练
-                        return
-                    yield patch, img_id
-                    idx += 1
-        else:
-            # 整体 RGB 处理 (H, W, 3) -> (16, 16, 3) patches
-            for patch in image_extractor(data, patch_size):
-                if idx >= num_chunks and num_chunks > 0:
-                    return
-                yield patch, img_id
-                idx += 1
+  """
+  获取数据集的 Patch 迭代器
+  """
+  image_dataset = _get_image_dataset(data_path)
+  idx = 0
+  image_extractor = _extract_image_sequence if is_seq else _extract_image_patches
+  
+  for data, img_id in image_dataset:
+    if is_channel_wised:
+      # 遍历3个颜色通道 (R, G, B)
+      for i in range(data.shape[-1]):
+        temp_data = data[:, :, i:i+1]
+        for patch in image_extractor(temp_data, patch_size):
+          if idx >= num_chunks and num_chunks > 0: # 增加 num_chunks > 0 判断，方便全量训练
+            return
+          yield patch, img_id
+          idx += 1
+    else:
+      # 整体 RGB 处理 (H, W, 3) -> (16, 16, 3) patches
+      for patch in image_extractor(data, patch_size):
+        if idx >= num_chunks and num_chunks > 0:
+          return
+        yield patch, img_id
+        idx += 1
 
 
 def patch_visualize(patch_data, save_path, patch_name):
-    """
-    将图像块可视化并保存为RGB图。
+  """
+  将图像块可视化并保存为RGB图。
 
-    参数:
-    patch_data (np.ndarray): 形状为 (h, w, 3) 的RGB图像块数据
-    """
-    patch_data = np.asarray(patch_data)
-    
-    # 正确的错误检查
-    if patch_data.ndim != 3 or patch_data.shape[2] != 3:
-        raise ValueError("patch_data 必须是 (h, w, 3) 的RGB图像")
-    
-    # 更安全的数据类型处理
-    if patch_data.dtype == np.float32 or patch_data.dtype == np.float64:
-        # 如果是浮点数，假设范围是0-1，转换为0-255
-        if patch_data.max() <= 1.0:
-            patch_data = (patch_data * 255).astype(np.uint8)
-        else:
-            patch_data = patch_data.astype(np.uint8)
+  参数:
+  patch_data (np.ndarray): 形状为 (h, w, 3) 的RGB图像块数据
+  """
+  patch_data = np.asarray(patch_data)
+  
+  # 正确的错误检查
+  if patch_data.ndim != 3 or patch_data.shape[2] != 3:
+    raise ValueError("patch_data 必须是 (h, w, 3) 的RGB图像")
+  
+  # 更安全的数据类型处理
+  if patch_data.dtype == np.float32 or patch_data.dtype == np.float64:
+    # 如果是浮点数，假设范围是0-1，转换为0-255
+    if patch_data.max() <= 1.0:
+      patch_data = (patch_data * 255).astype(np.uint8)
     else:
-        patch_data = patch_data.astype(np.uint8)
-    
-    # 使用 PIL 保存RGB图像
-    img = Image.fromarray(patch_data, mode='RGB')
-    img.save(f'{save_path}/patch{patch_name}.png')
-    plt.close()
+      patch_data = patch_data.astype(np.uint8)
+  else:
+    patch_data = patch_data.astype(np.uint8)
+  
+  img = Image.fromarray(patch_data, mode='RGB')
+  img.save(f'{save_path}/patch{patch_name}.png')
+  plt.close()
 
 
 # class Div2kPatchDataset(IterableDataset):
@@ -273,83 +270,91 @@ def patch_visualize(patch_data, save_path, patch_name):
 #       return num_files * multiplier
 
 class Div2kPatchDataset(Dataset):
-    def __init__(self, data_path, tokenizer, samples_per_image=50, is_channel_wised=False, shuffle=True, split='train'):
-        super().__init__()
-        self.data_path = data_path
-        self.tokenizer = tokenizer
-        self.samples_per_image = samples_per_image
-        self.is_channel_wised = is_channel_wised
-        self.split = split
-        
-        # 预加载文件列表
-        if not os.path.exists(data_path):
-             raise ValueError(f"Data path {data_path} does not exist.")
-        
-        self.all_files = [
-            os.path.join(data_path, item) 
-            for item in os.listdir(data_path) 
-            if item.lower().endswith('.png')
-        ]
-        self.all_files = natsorted(self.all_files)
-        # 不需要 random.shuffle(self.all_files)，交给 DataLoader 的 shuffle=True 处理
+  def __init__(self, data_path, tokenizer, samples_per_image=50, is_channel_wised=False, shuffle=True, split='train'):
+    super().__init__()
+    self.data_path = data_path
+    self.tokenizer = tokenizer
+    self.samples_per_image = samples_per_image
+    self.is_channel_wised = is_channel_wised
+    self.split = split
+    
+    # 预加载文件列表
+    if not os.path.exists(data_path):
+      raise ValueError(f"Data path {data_path} does not exist.")
+    
+    self.all_files = [
+      os.path.join(data_path, item) 
+      for item in os.listdir(data_path) 
+      if item.lower().endswith('.png')
+    ]
+    self.all_files = natsorted(self.all_files)
+    # 不需要 random.shuffle(self.all_files)，交给 DataLoader 的 shuffle=True 处理
 
-        # 数据增广
-        if split == 'train':
-            self.transform = transforms.Compose([
-                transforms.RandomCrop(size=(32, 32)),
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.RandomVerticalFlip(p=0.5),
-            ])
-        else:
-            self.transform = transforms.Compose([
-                transforms.CenterCrop(size=(32, 32)),
-            ])
+    # 数据增广
+    if split == 'train':
+      self.transform = transforms.Compose([
+        transforms.RandomCrop(size=(32, 32)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.5),
+      ])
+    else:
+      self.transform = transforms.Compose([
+        transforms.CenterCrop(size=(32, 32)),
+      ])
 
-    def process_patch_to_tokens(self, patch):
-        flat_pixels = patch.flatten() 
-        num_str_tokens = [str(val) for val in flat_pixels]
-        input_ids = self.tokenizer.convert_tokens_to_ids(num_str_tokens)
-        return torch.tensor(input_ids, dtype=torch.long)
+  def process_patch_to_tokens(self, patch):
+    flat_pixels = patch.flatten() 
+    num_str_tokens = [str(val) for val in flat_pixels]
+    input_ids = self.tokenizer.convert_tokens_to_ids(num_str_tokens)
+    return torch.tensor(input_ids, dtype=torch.long)
 
-    def __len__(self):
-        # 总样本数 = 图片数 * 每张图采样数
-        total = len(self.all_files) * self.samples_per_image
-        if self.is_channel_wised:
-            total *= 3
-        return total
+  def __len__(self):
+    # 总样本数 = 图片数 * 每张图采样数
+    total = len(self.all_files) * self.samples_per_image
+    if self.is_channel_wised:
+      total *= 3
+    return total
 
-    def __getitem__(self, idx):
-        # 1. 确定当前 idx 对应哪张图、哪个通道
-        if self.is_channel_wised:
-            file_idx = idx // (self.samples_per_image * 3)
-            remainder = idx % (self.samples_per_image * 3)
-            # sample_idx = remainder // 3 (其实不需要用到，只需要知道是第几次crop)
-            channel_idx = remainder % 3
-        else:
-            file_idx = idx // self.samples_per_image
-            channel_idx = -1 # 表示全通道
+  def __getitem__(self, idx):
+    # 1. 确定当前 idx 对应哪张图、哪个通道
+    if self.is_channel_wised:
+      file_idx = idx // (self.samples_per_image * 3)
+      remainder = idx % (self.samples_per_image * 3)
+      # sample_idx = remainder // 3 (其实不需要用到，只需要知道是第几次crop)
+      channel_idx = remainder % 3
+    else:
+      file_idx = idx // self.samples_per_image
+      channel_idx = -1 # 表示全通道
 
-        # 2. 读取图片
-        file_path = self.all_files[file_idx]
-        image_np = imageio.v2.imread(file_path) # 或使用 PIL.Image.open
-        image_pil = Image.fromarray(image_np)
+    # 2. 读取图片
+    file_path = self.all_files[file_idx]
+    image_np = imageio.v2.imread(file_path) # 或使用 PIL.Image.open
+    image_pil = Image.fromarray(image_np)
 
-        # 3. 随机裁剪 (每次 getitem 都会重新随机裁剪，保证多样性)
-        image_pil = self.transform(image_pil)
-        patch = np.array(image_pil) # (32, 32, 3)
+    # 3. 随机裁剪 (每次 getitem 都会重新随机裁剪，保证多样性)
+    image_pil = self.transform(image_pil)
+    patch = np.array(image_pil) # (32, 32, 3)
 
-        # 4. 提取通道
-        if self.is_channel_wised:
-            patch = patch[:, :, channel_idx : channel_idx+1] # (32, 32, 1)
+    # 4. 提取通道
+    if self.is_channel_wised:
+      patch = patch[:, :, channel_idx : channel_idx+1] # (32, 32, 1)
 
-        # 5. 转 Token
-        input_ids = self.process_patch_to_tokens(patch)
-        attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+    # ================== 数据重排逻辑 (CPU) ==================
+    # Block 内由光栅扫描改为 Patch 扫描
+    # 逻辑: (32,32) -> (2行块, 16行内, 2列块, 16列内) -> (2行块, 2列块, 16行内, 16列内)
+    patch = patch.reshape(2, 16, 2, 16, patch.shape[-1])
+    patch = patch.transpose(0, 2, 1, 3, 4)
+    patch = patch.reshape(-1, patch.shape[-1])
+    # ========================================================
+    
+    # 5. 转 Token
+    input_ids = self.process_patch_to_tokens(patch)
+    attention_mask = torch.ones_like(input_ids, dtype=torch.long)
 
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask
-        }
+    return {
+      "input_ids": input_ids,
+      "attention_mask": attention_mask
+    }
 
 class RandomFaultTolerantSampler(torch.utils.data.RandomSampler):
 

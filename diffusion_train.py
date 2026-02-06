@@ -55,19 +55,15 @@ class Diffusion(L.LightningModule):
       self.backbone = transformers.AutoModelForMaskedLM.from_pretrained(
         config.training.from_pretrained, trust_remote_code=True, local_files_only=True)
       
-      # ================== 核心修复开始 ==================
-      # [说明] 无论预训练模型是什么配置，都强制使用当前 YAML 的参数覆盖它
-      # 避免 block_size 错位或 cross_attn 未开启导致的数据泄露
-      print(f"[Force Config] Overriding model config: block_size={self.config.block_size}, cross_attn=True")
+      # ================== 核心修复==================
       # 1. 强制更新 Config 对象中的关键参数
       self.backbone.config.model_length = self.config.model.length
       self.backbone.config.block_size = self.config.block_size  # 关键：修正为 256
       self.backbone.config.cross_attn = True                    # 关键：开启 Cross Attn
       self.backbone.config.attn_backend = self.config.model.attn_backend
       
-      # 2. 强制将配置同步到底层 Backbone 模块 (防止有模块没引用 config 对象)
+      # 2. 强制将配置同步到底层 Backbone 模块
       if hasattr(self.backbone, "backbone"):
-        # 同步属性
         self.backbone.backbone.block_size = self.config.block_size
         self.backbone.backbone.cross_attn = True
         self.backbone.backbone.attn_backend = self.config.model.attn_backend
@@ -79,15 +75,13 @@ class Diffusion(L.LightningModule):
             block.block_size = self.config.block_size # 确保 Block 内部切分逻辑正确
         
         # 3. [最关键一步] 重新生成 Attention Mask
-        # 这会根据 cross_attn=True 和 block_size=256 生成正确的掩码
-        # 从而遮挡住 x0，防止泄露
         print(f"[Mask Gen] Regenerating attention mask with block_size={self.config.block_size}...")
         self.backbone.backbone.gen_mask(
           seqlen=self.config.model.length, 
           block_size=self.config.block_size, 
           attn_backend=self.config.model.attn_backend
         )
-      # ================== 核心修复结束 ==================
+      # =============================================
       
       # Regenerate mask if pretrained model uses flex attention mask
       # and current model uses sdpa mask
@@ -286,11 +280,6 @@ class Diffusion(L.LightningModule):
     
     x_input = batch['input_ids']
     x_mask = batch['attention_mask']
-    # =================== Block 内由光栅扫描改为 Patch 扫描 ===================
-    # 执行重排：从 Raster (8x32 blocks) -> Pure Block (16x16 blocks)
-    x_input = self._rearrange_raster_to_block(x_input)
-    x_mask = self._rearrange_raster_to_block(x_mask)
-    # ========================================================================
     losses = self._loss(x_input, x_mask)
     
     self.metrics.train_nlls.update(losses.nlls, losses.token_mask)
@@ -321,11 +310,6 @@ class Diffusion(L.LightningModule):
   def validation_step(self, batch, batch_idx):
     x_input = batch['input_ids']
     x_mask = batch['attention_mask']
-    # =================== Block 内由光栅扫描改为 Patch 扫描 ===================
-    # 执行重排：从 Raster (8x32 blocks) -> Pure Block (16x16 blocks)
-    x_input = self._rearrange_raster_to_block(x_input)
-    x_mask = self._rearrange_raster_to_block(x_mask)
-    # ========================================================================
     for noise_clip_start in self.metrics.valid_vars.keys():
       sampling_eps_min, sampling_eps_max = noise_clip_start
       if self._check_val_sampling_intvl(sampling_eps_min, sampling_eps_max) == True:
@@ -749,17 +733,11 @@ class Diffusion(L.LightningModule):
 
   # 动态获取当前 sigma，用于 Soft Loss 平滑
   def _get_current_sigma(self):
-    # 初始 sigma (比较模糊，利于收敛)
-    start_sigma = 2.0
-    # 最终 sigma (比较锐利，利于细节)
-    end_sigma = 0.5
-    # 获取当前步数和总步数
-    step = self.trainer.global_step
+    start_sigma = 2.0  # 初始 sigma (比较模糊，利于收敛)
+    end_sigma = 0.5  # 最终 sigma (比较锐利，利于细节)
     
-    if hasattr(self, 'trainer') and self.trainer.max_steps > 0:
-        total_steps = self.trainer.max_steps
-    else:
-        total_steps = 60000 # 兜底默认值
+    step = self.trainer.global_step
+    total_steps = self.trainer.max_steps
         
     # 计算进度 (0.0 -> 1.0)
     progress = min(1.0, step / total_steps)
@@ -768,29 +746,3 @@ class Diffusion(L.LightningModule):
     current_sigma = start_sigma - (start_sigma - end_sigma) * progress
     
     return current_sigma
-
-  # 将光栅扫描序列重排为 Block 扫描序列
-  def _rearrange_raster_to_block(self, x):
-    """
-    Input: [B, 1024] (Raster Scan: 32x32)
-    Output: [B, 1024] (Block Scan: 4 blocks of 16x16)
-    """
-    B, L = x.shape
-    image_size = np.sqrt(L).astype(int)  # 32
-    H, W = image_size, image_size
-    patch_size = np.sqrt(self.block_size).astype(int)  # 16
-    bh, bw = patch_size, patch_size
-    
-    # 1. 还原为 2D 图像 [B, 32, 32]
-    x_img = x.view(B, H, W)
-    
-    # 2. 切分为 (B, 块行数, 块高, 块列数, 块宽) -> (B, 2, 16, 2, 16)
-    x_blocked = x_img.view(B, H // bh, bh, W // bw, bw)
-    
-    # 3. 维度置换：把块索引放在前面 (B, 块行数, 块列数, 块高, 块宽)
-    # Permute: (0, 1, 3, 2, 4)
-    x_permuted = x_blocked.permute(0, 1, 3, 2, 4)
-    
-    # 4. 展平回 [B, 1024]
-    # 此时的顺序是：Block(0,0)全像素 -> Block(0,1)全像素 -> ...
-    return x_permuted.reshape(B, -1)
