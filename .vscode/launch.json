@@ -46,18 +46,51 @@
         "PYTHONPATH": "${workspaceFolder}"
       },
       "args": [
-        "algo.backbone=dit",
+        "algo.backbone=hf_dit",
         "algo.T=3",
-        "block_size=64",
-        "loader.eval_batch_size=1",
-        "sampling.checkpoint_path=/mnt/e/1Master1/0Science_Research/0DLM-SSCC/Model/bd3lm/bd3lm-owt-block_size64/best.ckpt",
+        "block_size=16",
+        "loader.eval_batch_size=10",
+        "sampling.checkpoint_path=/data_133/rtq/Model/bd3lm/bd3lm-owt-block_size16",
         "sampling.first_hitting=False",
         "sampling.reset_channel_context=True",
         "model.length=1024",
-        "data.test_dataset=DIV2K",
-        "data.image_size_test=256",
-        "data.num_images_test=1",
+        "data.test_dataset=CIFAR10",
+        "data.image_size_test=32",
+        "data.num_images_test=10",
         "model.attn_backend=sdpa",
+      ]
+    },
+    {
+      "name": "调试 train",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/train_bd3lm.py",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "TRANSFORMERS_OFFLINE": "1",
+        // "HF_HUB_OFFLINE": "1",
+        "PYTHONPATH": "${workspaceFolder}"
+      },
+      "args": [
+        "loader.data_dir=/data_133/rtq/Dataset/DIV2K/DIV2K_LR_unified/X4",
+        "loader.global_batch_size=256",
+        "loader.eval_global_batch_size=256",
+        "loader.batch_size=4",
+        "loader.eval_batch_size=4",
+        "model=small",
+        "algo=bd3lm",
+        "algo.backbone=hf_dit",
+        "algo.clip_search_widths=[0.5,0.6,0.7,0.8,0.9]",
+        "algo.fix_clipping=True",
+        "model.length=1024",
+        "block_size=256",
+        "wandb.name=bd3lm-div2k-block_size256-260203",
+        "mode=train",
+        "model.attn_backend=flex",
+        "training.resample=True",
+        "training.from_pretrained=/data_133/rtq/Model/bd3lm/bd3lm-owt-block_size1024-pretrain",
+        "data.tokenizer_name_or_path=/data_133/rtq/Model/gpt2"
       ]
     },
     {

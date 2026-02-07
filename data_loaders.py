@@ -104,7 +104,7 @@ def get_image_iterator(
     num_chunks: int = -1,
     is_channel_wised: bool = True,
     is_seq: bool = False,
-    stripe_width: int = None,
+    stripe_width: int = 0,
     data_path: str = None,
 ) -> Iterator[bytes]:
   """
@@ -116,7 +116,7 @@ def get_image_iterator(
   
   for data, img_id in image_dataset:
     # --- 条带化逻辑分流 ---
-    if stripe_width is not None:
+    if stripe_width > 0:
       # 先切条带，再对每个条带提取 patch
       stripes = _extract_image_stripes(data, stripe_width)
     else:
